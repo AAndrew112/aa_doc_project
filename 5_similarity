@@ -1,0 +1,159 @@
+# ---------------------------------------------------------
+# 5_similarity.py
+# Find near-duplicate documents (TF-IDF + cosine similarity)
+# - Reads chunked corpus (csv or parquet)
+# - Re-aggregates chunks -> one string per doc_id
+# - Builds TF-IDF vectors (1–2 grams, English stopwords)
+# - Finds pairs with cosine similarity >= THRESH
+# - Builds connected-component clusters (union-find)
+# - Writes pairs, clusters, and a tiny summary
+# ---------------------------------------------------------
+
+from pathlib import Path
+import math
+import numpy as np
+import pandas as pd
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+
+# -------- Inputs / Outputs --------
+IN_PARQUET = "data/corpus_chunks.parquet"   # use if you installed pyarrow
+IN_CSV     = "data/corpus_chunks.csv"       # fallback (you’re using this now)
+OUT_PAIRS  = "data/similar_pairs.csv"
+OUT_CLUST  = "data/clusters.csv"
+OUT_SUMMARY= "data/similarity_summary.txt"
+
+# -------- Tunables (safe defaults) --------
+MIN_DF     = 2              # ignore terms seen in fewer than 2 docs
+NGRAMS     = (1, 2)         # unigrams + bigrams
+THRESH     = 0.80           # pair considered near-duplicate at or above this
+BATCH      = 1500           # compare in blocks to avoid huge memory spikes
+
+# ---------------------------------------------------------
+# Helper: read chunked corpus (csv or parquet)
+# ---------------------------------------------------------
+def read_chunks():
+    p_csv = Path(IN_CSV)
+    p_par = Path(IN_PARQUET)
+    if p_par.exists():
+        df = pd.read_parquet(p_par)
+    elif p_csv.exists():
+        df = pd.read_csv(p_csv)
+    else:
+        raise FileNotFoundError("Neither corpus_chunks.parquet nor corpus_chunks.csv found in data/.")
+    # Expected columns: doc_id, chunk_id, text_chunk, (file_type, needs_ocr, word_count)
+    needed = {"doc_id", "text_chunk"}
+    missing = needed - set(df.columns)
+    if missing:
+        raise ValueError(f"Missing columns in chunk file: {missing}")
+    return df
+
+# ---------------------------------------------------------
+# Helper: union-find for clustering
+# ---------------------------------------------------------
+def clusters_from_pairs(pairs, ids):
+    # pairs: list of (a, b) doc_id strings
+    parent = {i: i for i in ids}
+
+    def find(x):
+        # path compression
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    for a, b in pairs:
+        union(a, b)
+
+    # collect components
+    groups = {}
+    for i in ids:
+        root = find(i)
+        groups.setdefault(root, []).append(i)
+    # return list of lists
+    return list(groups.values())
+
+# ---------------------------------------------------------
+# Main
+# ---------------------------------------------------------
+def main():
+    # 1) Load chunked corpus
+    chunks = read_chunks()
+
+    # 2) Re-aggregate to doc-level text (join chunks back together)
+    docs = (
+        chunks.groupby("doc_id", sort=False)["text_chunk"]
+              .apply(lambda s: " ".join(map(str, s.fillna(""))))
+              .reset_index()
+    )
+    ids   = docs["doc_id"].tolist()
+    texts = docs["text_chunk"].fillna("").tolist()
+    n = len(ids)
+    print(f"Docs to compare: {n}")
+
+    # 3) Vectorize with TF-IDF (sparse matrix)
+    vectorizer = TfidfVectorizer(
+        stop_words="english",
+        ngram_range=NGRAMS,
+        min_df=MIN_DF
+    )
+    X = vectorizer.fit_transform(texts)   # shape = (n_docs, n_terms), sparse CSR
+
+    # 4) Pairwise cosine similarity in batches, collect pairs >= THRESH
+    pairs = []  # (id_a, id_b, score)
+    for start in range(0, n, BATCH):
+        end = min(start + BATCH, n)
+        # Compare block [start:end] vs ALL (upper triangle logic below)
+        sim_block = cosine_similarity(X[start:end], X)  # dense small-ish block
+        # Iterate only j > i to avoid duplicates and self-pairs
+        for i in range(end - start):
+            global_i = start + i
+            row = sim_block[i]
+            # start comparison at next doc to keep upper triangle
+            for j in range(global_i + 1, n):
+                s = row[j]
+                if s >= THRESH:
+                    pairs.append((ids[global_i], ids[j], float(s)))
+
+    # 5) Save similar pairs (sorted by similarity desc)
+    pairs_df = pd.DataFrame(pairs, columns=["doc_id_a", "doc_id_b", "similarity"])
+    if not pairs_df.empty:
+        pairs_df = pairs_df.sort_values("similarity", ascending=False)
+    Path(OUT_PAIRS).parent.mkdir(parents=True, exist_ok=True)
+    pairs_df.to_csv(OUT_PAIRS, index=False)
+
+    # 6) Build clusters from pairs (connected components)
+    if pairs:
+        pair_edges = [(a, b) for a, b, _ in pairs]
+        comps = clusters_from_pairs(pair_edges, ids)
+    else:
+        # No pairs above threshold -> every doc is its own cluster
+        comps = [[i] for i in ids]
+
+    # Flatten to DataFrame
+    rows = []
+    for cid, members in enumerate(sorted(comps, key=len, reverse=True), start=1):
+        for m in members:
+            rows.append({"cluster_id": cid, "doc_id": m, "cluster_size": len(members)})
+    clust_df = pd.DataFrame(rows).sort_values(["cluster_id", "doc_id"])
+    clust_df.to_csv(OUT_CLUST, index=False)
+
+    # 7) Tiny summary
+    redundant_docs = set(pairs_df["doc_id_a"]).union(set(pairs_df["doc_id_b"])) if not pairs_df.empty else set()
+    redundancy_pct = (len(redundant_docs) / max(1, n)) * 100.0
+    with open(OUT_SUMMARY, "w", encoding="utf-8") as f:
+        f.write(f"Docs compared: {n}\n")
+        f.write(f"Pairs >= {THRESH:.2f}: {len(pairs)}\n")
+        f.write(f"Estimated redundant docs: {len(redundant_docs)} ({redundancy_pct:.1f}%)\n")
+        f.write(f"Clusters: {clust_df['cluster_id'].nunique()} (largest size: {clust_df['cluster_size'].max()})\n")
+    print(f"Wrote {OUT_PAIRS} ({len(pairs)} pairs) and {OUT_CLUST} "
+          f"({clust_df['cluster_id'].nunique()} clusters).")
+    print(f"Summary: {OUT_SUMMARY}")
+
+if __name__ == "__main__":
+    main()
