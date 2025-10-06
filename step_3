@@ -1,0 +1,105 @@
+# ---------------------------------------------------------
+# clean_text.py
+# Step 3: Create a CLEAN corpus from corpus_raw.csv
+# - Normalize case/whitespace/unicode
+# - Strip headers/footers (line patterns)
+# - Strip boilerplate phrases
+# - Keep needs_ocr rows but leave text_clean empty
+# ---------------------------------------------------------
+
+from pathlib import Path
+import re
+import unicodedata
+import pandas as pd
+
+RAW_CSV     = "../data/corpus_raw.csv"
+CLEAN_CSV   = "../data/corpus_clean.csv"       # machine-readable
+PREVIEW_TSV = "../data/corpus_clean_preview.tsv"  # human preview (Excel-friendly)
+
+# --- Configure your patterns/phrases here (edit as you learn) ---
+
+# Lines that are page furniture (remove entire line if it matches)
+HEADER_FOOTER_PATTERNS = [
+    r"^\s*Oregon DOJ\b.*$",
+    r"^\s*Department of Justice\b.*$",
+    r"^\s*Page\s+\d+\s+of\s+\d+\s*$",
+]
+
+# Stock phrases that appear in many docs but aren't substantive
+BOILERPLATE_PHRASES = [
+    "this document is confidential and intended only for the recipient",
+    "all rights reserved",
+    "oregon department of justice",
+]
+
+def normalize_unicode(text: str) -> str:
+    """Fix curly quotes/dashes etc. NFC makes characters consistent."""
+    if not isinstance(text, str):
+        return ""
+    return unicodedata.normalize("NFC", text)
+
+def collapse_whitespace(text: str) -> str:
+    """Turn runs of whitespace (spaces/newlines/tabs) into single spaces."""
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def strip_lines_matching(text: str, patterns) -> str:
+    """Remove any line that matches any of the given regex patterns."""
+    if not text:
+        return ""
+    lines = text.splitlines()
+    compiled = [re.compile(p, flags=re.IGNORECASE) for p in patterns]
+    kept = []
+    for ln in lines:
+        if any(c.search(ln) for c in compiled):
+            continue
+        kept.append(ln)
+    return "\n".join(kept)
+
+def strip_boilerplate(text: str, phrases) -> str:
+    """Remove common stock phrases (case-insensitive)."""
+    out = text
+    for ph in phrases:
+        out = re.sub(re.escape(ph), " ", out, flags=re.IGNORECASE)
+    return out
+
+def word_count(text: str) -> int:
+    """Always return an integer word count."""
+    return int(len(re.findall(r"\b\w+\b", text or "")))
+
+def clean_one(text_raw: str) -> str:
+    """Apply: unicode normalize -> lowercase -> strip header/footer -> strip boilerplate -> collapse spaces."""
+    t = normalize_unicode(text_raw or "")
+    t = t.lower()
+    t = strip_lines_matching(t, HEADER_FOOTER_PATTERNS)
+    t = strip_boilerplate(t, BOILERPLATE_PHRASES)
+    t = collapse_whitespace(t)
+    return t
+
+def main():
+    df = pd.read_csv(RAW_CSV)
+
+    # Clean only rows that do NOT need OCR; keep others as empty clean text
+    clean_mask = df["needs_ocr"] == False
+    df.loc[clean_mask, "text_clean"] = df.loc[clean_mask, "text_raw"].apply(clean_one)
+    df.loc[~clean_mask, "text_clean"] = ""   # leave empty for OCR later
+
+    # Recompute word_count on clean text (for downstream checks)
+    df["word_count_clean"] = df["text_clean"].apply(word_count).astype("int64")
+
+    # Save outputs
+    Path(CLEAN_CSV).parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(CLEAN_CSV, index=False)
+
+    # Small Excel-friendly preview (no huge text, no newlines)
+    prev = df.copy()
+    prev["text_clean"] = prev["text_clean"].str.replace(r"[\r\n]+", " ", regex=True).str.slice(0, 500)
+    prev = prev[["doc_id", "file_type", "needs_ocr", "word_count", "word_count_clean", "text_clean"]]
+    prev.to_csv(PREVIEW_TSV, sep="\t", encoding="utf-8-sig", index=False)
+
+    print(f"Wrote {CLEAN_CSV} with {len(df)} rows.")
+    print(f"Preview: {PREVIEW_TSV}")
+    print(f"Rows needing OCR (kept blank): {int((~clean_mask).sum())}")
+
+if __name__ == "__main__":
+    main()
