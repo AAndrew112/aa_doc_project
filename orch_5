@@ -1,0 +1,65 @@
+# src/orchestrate.py
+"""
+orchestrate.py
+---------------
+Runs the full DOJ document deduplication pipeline:
+  1) Preprocessing (inventory, extract, clean, chunk)
+  2) Analysis (dedupe, complexity)
+
+Paths are configured for Amanda's machine:
+  - Source documents:  C:\Users\aa4\OneDrive - Oregon Department of Justice\dup_files
+  - Data folder:       C:\Users\aa4\dedup_project\data
+  - Scripts folder:    C:\Users\aa4\dedup_project\src
+
+Run from the project root (dedup_project):
+  py -m src.orchestrate --thresh 90
+"""
+
+from __future__ import annotations
+from pathlib import Path
+import argparse
+import pandas as pd
+from . import preprocess as pp
+from . import analyze as az
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--thresh", type=int, nargs="+", default=[80, 90],
+                        help="Thresholds to run, e.g. 80 90")
+    args = parser.parse_args()
+
+    # --- Fixed paths for your system ---
+    root = Path(r"C:\Users\aa4\OneDrive - Oregon Department of Justice\dup_files")  # documents
+    data = Path(r"C:\Users\aa4\dedup_project\data")  # output directory
+    data.mkdir(parents=True, exist_ok=True)
+
+    inv    = data / "inventory.csv"
+    raw    = data / "corpus_raw.csv"
+    clean  = data / "corpus_clean.csv"
+    chunks = data / "corpus_chunks.csv"
+
+    print("Running preprocessing...")
+    pp.stage_inventory(root, inv)
+
+    # Stop early if inventory is empty
+    if not inv.exists() or pd.read_csv(inv).empty:
+        print("[orchestrate] No supported files found under root (.pdf, .docx, .txt). Check your source folder path.")
+        return
+
+    pp.stage_extract(inv, raw)
+    pp.stage_clean(raw, clean)
+    pp.stage_chunk(clean, chunks, chunk_size=900, overlap=100)
+
+    print("Running analysis...")
+    for t_int in args.thresh:
+        t = float(t_int) / 100.0
+        out_dir = data / f"t{t_int}"
+        az.run_dedupe(chunks, out_dir, t, min_df=2, ngram_range=(1, 2), batch=1500)
+        az.run_complexity(clean, out_dir / "clusters.csv", out_dir)
+
+    print("\nAll done! Results are in:", data.resolve())
+
+
+if __name__ == "__main__":
+    main()
