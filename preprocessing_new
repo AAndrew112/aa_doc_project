@@ -1,0 +1,310 @@
+"""
+preprocess.py
+Runs the *data preparation* stages, end to end.
+
+Stages (you can run any subset):
+  - inventory: find files and record paths/types
+  - extract:   read text out of .docx / .pdf / .txt
+  - clean:     normalize, remove headers/footers/boilerplate
+  - chunk:     split long documents into ~900-word overlapping pieces
+
+USAGE EXAMPLES
+--------------
+# Run everything, starting from a folder of documents:
+python src/preprocess.py --root DOJ_DOCS
+
+# Only re-run cleaning and chunking (faster):
+python src/preprocess.py --run clean,chunk
+"""
+
+from __future__ import annotations
+from pathlib import Path   # safe path handling across Windows/Mac/Linux
+import argparse            # parse command-line options
+import csv, re, unicodedata
+import pandas as pd        # tables in/out (CSV)
+from docx import Document  # read .docx files  (pip install python-docx)
+import pdfplumber          # read digital PDFs (pip install pdfplumber)
+
+DATA_DIR = Path("data")    # all outputs go in data/
+
+# ---------- small helper functions ----------
+
+def word_count(text: str) -> int:
+    """Return how many 'words' are in the text. A simple regex is fine here."""
+    return len(re.findall(r"\b\w+\b", text or ""))
+
+def normalize_unicode(text: str) -> str:
+    """Make curly quotes/dashes/etc. consistent; prevents weird characters later."""
+    if not isinstance(text, str):
+        return ""
+    return unicodedata.normalize("NFC", text)
+
+def collapse_ws(text: str) -> str:
+    """Turn multiple spaces/newlines into a single space; trim ends."""
+    return re.sub(r"\s+", " ", text).strip()
+
+def strip_lines_matching(text: str, patterns) -> str:
+    """
+    Remove entire lines that match 'page furniture' like headers/footers.
+    We compile regexes once and test each line.
+    """
+    if not text:
+        return ""
+    lines = text.splitlines()
+    compiled = [re.compile(p, re.IGNORECASE) for p in patterns]
+    kept = []
+    for ln in lines:
+        if any(c.search(ln) for c in compiled):
+            continue  # drop this line entirely
+        kept.append(ln)
+    return "\n".join(kept)
+
+def strip_boilerplate(text: str, phrases) -> str:
+    """Remove stock phrases that appear in many docs (case-insensitive)."""
+    out = text
+    for ph in phrases:
+        out = re.sub(re.escape(ph), " ", out, flags=re.IGNORECASE)
+    return out
+
+def word_tokenize(text: str) -> list[str]:
+    """Simple 'split on whitespace' tokenizer (good enough for chunking)."""
+    return re.findall(r"\S+", text or "")
+
+def chunk_words(words: list[str], size: int, overlap: int):
+    """
+    Yield overlapping text chunks. If size=900 and overlap=100, each new chunk
+    moves forward by 800 words (900 - 100).
+    """
+    if size <= 0:
+        raise ValueError("CHUNK_SIZE must be > 0")
+    step = max(1, size - max(0, overlap))
+    for start in range(0, len(words), step):
+        end = start + size
+        yield " ".join(words[start:end])
+
+# ---------- STAGE 1: INVENTORY ----------
+
+def stage_inventory(root: Path, out_csv: Path):
+    """
+    Walk the folder tree under 'root' and record every file we find:
+    - doc_id   (relative path within root; becomes our stable ID)
+    - file_type (extension like 'pdf' or 'docx')
+    - file_path (absolute path on disk)
+    """
+    rows = []
+    for path in Path(root).rglob("*"):  # rglob = recursive search
+        if path.is_file():
+            rows.append({
+                "doc_id": str(path.relative_to(root)),
+                "file_type": path.suffix.lower().lstrip("."),  # '.pdf' -> 'pdf'
+                "file_path": str(path.resolve())
+            })
+    df = pd.DataFrame(rows)
+    out_csv.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(out_csv, index=False)
+    print(f"[inventory] wrote {out_csv} ({len(df)} files)")
+
+# ---------- STAGE 2: EXTRACT ----------
+
+def extract_docx(path_str: str) -> str:
+    """Open a .docx and join paragraph texts with newlines."""
+    doc = Document(path_str)
+    return "\n".join(p.text for p in doc.paragraphs)
+
+def extract_pdf(path_str: str) -> str:
+    """
+    Open a (digital) PDF and extract text per page.
+    If the PDF is scanned (image-only), pdfplumber returns None/empty.
+    """
+    parts = []
+    with pdfplumber.open(path_str) as pdf:
+        for page in pdf.pages:
+            parts.append(page.extract_text() or "")
+    return "\n".join(parts).strip()
+
+def stage_extract(inv_csv: Path, out_csv: Path):
+    """
+    Read inventory, open each supported file, store the raw text and a quick word count.
+    PDFs with almost no text get 'needs_ocr=True' (we'll handle later if needed).
+    """
+    inv = pd.read_csv(inv_csv)
+    inv = inv[inv["file_type"].str.lower().isin(["docx", "pdf", "txt"])].copy()
+
+    rows = []
+    for _, r in inv.iterrows():
+        doc_id, ftype, fpath = r["doc_id"], r["file_type"].lower(), r["file_path"]
+        text_raw, error = "", ""
+        try:
+            if ftype == "docx":
+                text_raw = extract_docx(fpath)
+            elif ftype == "pdf":
+                text_raw = extract_pdf(fpath)
+            elif ftype == "txt":
+                with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
+                    text_raw = f.read()
+        except Exception as e:
+            # Never crash the whole run; record the error for this file
+            error = f"{type(e).__name__}: {e}"
+            text_raw = ""
+
+        wc = word_count(text_raw)
+        needs_ocr = bool(ftype == "pdf" and wc < 15)  # tiny text -> likely scanned
+
+        rows.append({
+            "doc_id": doc_id,
+            "file_type": ftype,
+            "word_count": wc,
+            "needs_ocr": needs_ocr,
+            "text_raw": text_raw,
+            "error": error
+        })
+
+    df = pd.DataFrame(rows)
+    out_csv.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(out_csv, index=False)
+    print(f"[extract] wrote {out_csv} ({len(df)} rows) "
+          f"needs_ocr={int(df['needs_ocr'].sum())} errors={int(df['error'].astype(bool).sum())}")
+
+# ---------- STAGE 3: CLEAN ----------
+
+def stage_clean(raw_csv: Path, out_csv: Path,
+                header_patterns: list[str] | None = None,
+                boilerplate_phrases: list[str] | None = None):
+    """
+    Make the text analysis-friendly:
+      - normalize unicode
+      - lowercase
+      - remove lines that look like headers/footers (Page X of Y, etc.)
+      - remove boilerplate phrases (kept small and conservative)
+      - collapse whitespace
+    """
+    # sensible defaults (you can customize these later)
+    if header_patterns is None:
+        header_patterns = [
+            r'^\s*(Oregon DOJ|Department of Justice)\b.*$',
+            r'^\s*Page\s*\d+\s*(of\s*\d+)?\s*$',
+        ]
+    if boilerplate_phrases is None:
+        boilerplate_phrases = [
+            "this document is confidential and intended only for the recipient",
+            "all rights reserved",
+            "oregon department of justice",
+        ]
+
+    df = pd.read_csv(raw_csv)
+    clean_mask = df["needs_ocr"] == False  # only clean docs that actually have text
+
+    def clean_one(t: str) -> str:
+        t = normalize_unicode(t or "")
+        t = t.lower()
+        t = strip_lines_matching(t, header_patterns)
+        t = strip_boilerplate(t, boilerplate_phrases)
+        t = collapse_ws(t)
+        return t
+
+    # Apply cleaning only where we have text; leave OCR-needed rows blank for now
+    df.loc[clean_mask, "text_clean"] = df.loc[clean_mask, "text_raw"].apply(clean_one)
+    df.loc[~clean_mask, "text_clean"] = ""
+    df["word_count_clean"] = df["text_clean"].apply(word_count).astype("int64")
+
+    out_csv.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(out_csv, index=False)
+
+    # A small preview file you can open in Excel without breaking columns
+    prev = df.copy()
+    prev["text_clean"] = prev["text_clean"].str.replace(r"[\r\n]+", " ", regex=True).str.slice(0, 500)
+    prev[["doc_id", "file_type", "needs_ocr", "word_count", "word_count_clean", "text_clean"]] \
+        .to_csv(out_csv.with_name("corpus_clean_preview.tsv"),
+                sep="\t", encoding="utf-8-sig", index=False, quoting=csv.QUOTE_MINIMAL)
+    print(f"[clean] wrote {out_csv} ({len(df)} rows)")
+
+# ---------- STAGE 4: CHUNK ----------
+
+def stage_chunk(clean_csv: Path, out_csv: Path, chunk_size: int = 900, overlap: int = 100):
+    """
+    Split long docs into overlapping chunks so big manuals don't dominate similarity.
+    Short docs remain 1 chunk. OCR-needed docs get a single empty chunk (traceable).
+    """
+    df = pd.read_csv(clean_csv)
+
+    rows = []
+    for _, r in df.iterrows():
+        doc_id, ftype = r["doc_id"], r["file_type"]
+        needs_ocr = bool(r.get("needs_ocr", False))
+        text = str(r.get("text_clean", "") or "")
+
+        if needs_ocr or not text.strip():
+            # Keep an empty chunk row so downstream steps can still include this doc
+            rows.append({
+                "doc_id": doc_id, "file_type": ftype, "chunk_id": 0,
+                "word_count": 0, "text_chunk": "", "needs_ocr": needs_ocr
+            })
+            continue
+
+        words = word_tokenize(text)
+
+        if len(words) <= chunk_size:
+            # Short doc → single chunk (no overlap needed)
+            rows.append({
+                "doc_id": doc_id, "file_type": ftype, "chunk_id": 0,
+                "word_count": len(words), "text_chunk": " ".join(words), "needs_ocr": needs_ocr
+            })
+            continue
+
+        # Long doc → overlapping windows
+        for idx, ch in enumerate(chunk_words(words, chunk_size, overlap)):
+            if not ch:
+                continue
+            rows.append({
+                "doc_id": doc_id, "file_type": ftype, "chunk_id": idx,
+                "word_count": len(ch.split()), "text_chunk": ch, "needs_ocr": needs_ocr
+            })
+
+    out = pd.DataFrame(rows)
+    out_csv.parent.mkdir(parents=True, exist_ok=True)
+    out.to_csv(out_csv, index=False)
+
+    # Human-friendly preview (short, single-line text)
+    prev = out.copy()
+    prev["text_chunk"] = prev["text_chunk"].str.replace(r"[\r\n]+", " ", regex=True).str.slice(0, 400)
+    prev.to_csv(out_csv.with_name("corpus_chunks_preview.tsv"),
+                sep="\t", encoding="utf-8-sig", index=False)
+
+    print(f"[chunk] wrote {out_csv} ({len(out)} chunk-rows, "
+          f"docs={out['doc_id'].nunique()}, chunks/doc~{len(out)/max(1,out['doc_id'].nunique()):.1f})")
+
+# ---------- command-line entry point ----------
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--root", type=str, default=None,
+                        help="Top folder of your documents (needed for inventory)")
+    parser.add_argument("--run", type=str, default="inventory,extract,clean,chunk",
+                        help="Which stages to run (comma list)")
+    parser.add_argument("--chunk-size", type=int, default=900)
+    parser.add_argument("--overlap", type=int, default=100)
+    args = parser.parse_args()
+
+    stages = [s.strip().lower() for s in args.run.split(",") if s.strip()]
+
+    inv_csv    = DATA_DIR / "inventory.csv"
+    raw_csv    = DATA_DIR / "corpus_raw.csv"
+    clean_csv  = DATA_DIR / "corpus_clean.csv"
+    chunks_csv = DATA_DIR / "corpus_chunks.csv"
+
+    if "inventory" in stages:
+        if not args.root:
+            raise SystemExit("--root is required for inventory")
+        stage_inventory(Path(args.root), inv_csv)
+
+    if "extract" in stages:
+        stage_extract(inv_csv, raw_csv)
+
+    if "clean" in stages:
+        stage_clean(raw_csv, clean_csv)
+
+    if "chunk" in stages:
+        stage_chunk(clean_csv, chunks_csv, args.chunk_size, args.overlap)
+
+if __name__ == "__main__":
+    main()
