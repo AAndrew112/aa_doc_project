@@ -1,0 +1,125 @@
+# ---------------------------------------------------------
+# 5_similarity.py  (CSV-only, includes avg_similarity)
+# ---------------------------------------------------------
+from pathlib import Path
+import numpy as np
+import pandas as pd
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+
+# -------- Inputs / Outputs --------
+IN_CSV     = "data/corpus_chunks.csv"          # input from Step 4
+OUT_PAIRS  = "data/similar_pairs.csv"          # or *_80 / *_90 for different runs
+OUT_CLUST  = "data/clusters.csv"
+OUT_SUMMARY= "data/similarity_summary.txt"
+
+# -------- Tunables --------
+MIN_DF     = 2
+NGRAMS     = (1, 2)
+THRESH     = 0.80          # raise to 0.90 for stricter matches
+BATCH      = 1500          # compare in chunks to limit memory
+
+# ---------------------------------------------------------
+# Helper: union-find clustering
+# ---------------------------------------------------------
+def clusters_from_pairs(pairs, ids):
+    parent = {i: i for i in ids}
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+    for a, b in pairs:
+        union(a, b)
+    groups = {}
+    for i in ids:
+        root = find(i)
+        groups.setdefault(root, []).append(i)
+    return list(groups.values())
+
+# ---------------------------------------------------------
+# Main
+# ---------------------------------------------------------
+def main():
+    # 1) Load chunked corpus
+    df = pd.read_csv(IN_CSV)
+    if not {"doc_id", "text_chunk"}.issubset(df.columns):
+        raise ValueError("Input must contain 'doc_id' and 'text_chunk' columns.")
+
+    # 2) Re-aggregate to doc level
+    docs = (
+        df.groupby("doc_id", sort=False)["text_chunk"]
+          .apply(lambda s: " ".join(map(str, s.fillna(""))))
+          .reset_index()
+    )
+    ids   = docs["doc_id"].tolist()
+    texts = docs["text_chunk"].fillna("").tolist()
+    n = len(ids)
+    print(f"Docs to compare: {n}")
+
+    # 3) TF-IDF vectorization
+    vectorizer = TfidfVectorizer(stop_words="english",
+                                 ngram_range=NGRAMS,
+                                 min_df=MIN_DF)
+    X = vectorizer.fit_transform(texts)
+
+    # 4) Compute cosine similarity in batches
+    pairs = []
+    for start in range(0, n, BATCH):
+        end = min(start + BATCH, n)
+        sims = cosine_similarity(X[start:end], X)
+        for i in range(end - start):
+            gi = start + i
+            row = sims[i]
+            for j in range(gi + 1, n):
+                s = row[j]
+                if s >= THRESH:
+                    pairs.append((ids[gi], ids[j], float(s)))
+
+    # 5) Save pairs
+    pairs_df = pd.DataFrame(pairs, columns=["doc_id_a", "doc_id_b", "similarity"])
+    pairs_df.sort_values("similarity", ascending=False, inplace=True)
+    Path(OUT_PAIRS).parent.mkdir(parents=True, exist_ok=True)
+    pairs_df.to_csv(OUT_PAIRS, index=False)
+
+    # 6) Build clusters
+    comps = clusters_from_pairs([(a, b) for a, b, _ in pairs], ids) if pairs else [[i] for i in ids]
+    rows = []
+    for cid, members in enumerate(sorted(comps, key=len, reverse=True), start=1):
+        for m in members:
+            rows.append({"cluster_id": cid, "doc_id": m, "cluster_size": len(members)})
+    clust_df = pd.DataFrame(rows)
+
+    # 7) Add avg_similarity per cluster
+    if not pairs_df.empty:
+        doc_to_cluster = clust_df.set_index("doc_id")["cluster_id"].to_dict()
+        pairs_df["cluster_id"] = pairs_df["doc_id_a"].map(doc_to_cluster)
+        cluster_rel = (
+            pairs_df.groupby("cluster_id")["similarity"]
+                    .mean().reset_index()
+                    .rename(columns={"similarity": "avg_similarity"})
+        )
+        clust_df = clust_df.merge(cluster_rel, on="cluster_id", how="left")
+    clust_df["avg_similarity"].fillna(0, inplace=True)
+
+    # 8) Save outputs + summary
+    clust_df.to_csv(OUT_CLUST, index=False)
+    redundant_docs = set(pairs_df["doc_id_a"]).union(set(pairs_df["doc_id_b"]))
+    redundancy_pct = (len(redundant_docs) / max(1, n)) * 100
+    with open(OUT_SUMMARY, "w", encoding="utf-8") as f:
+        f.write(f"Docs compared: {n}\n")
+        f.write(f"Pairs ≥ {THRESH:.2f}: {len(pairs)}\n")
+        f.write(f"Redundant docs: {len(redundant_docs)} ({redundancy_pct:.1f}%)\n")
+        f.write(f"Clusters: {clust_df['cluster_id'].nunique()} "
+                f"(largest size: {clust_df['cluster_size'].max()})\n")
+        f.write(f"Mean cluster relatedness: "
+                f"{clust_df.drop_duplicates('cluster_id')['avg_similarity'].mean():.3f}\n")
+
+    print(f"Wrote {OUT_PAIRS}, {OUT_CLUST}, and {OUT_SUMMARY}")
+
+if __name__ == "__main__":
+    main()
