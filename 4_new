@@ -1,0 +1,97 @@
+# ---------------------------------------------------------
+# 4_chunk_text.py
+# Split cleaned documents into overlapping word chunks.
+# Input:  data/corpus_clean.csv  (has text_clean)
+# Output: data/corpus_chunks.csv + preview TSV
+# ---------------------------------------------------------
+
+from pathlib import Path
+import re
+import pandas as pd
+
+INPUT_CSV = "data/corpus_clean.csv"
+OUT_CSV   = "data/corpus_chunks.csv"
+OUT_TSV   = "data/corpus_chunks_preview.tsv"  # Excel-friendly
+
+# Tunables
+CHUNK_SIZE = 900     # target words per chunk
+OVERLAP    = 100     # words to overlap between consecutive chunks
+
+def word_tokenize(text: str) -> list[str]:
+    """Very simple word tokenizer (good enough for chunking)."""
+    return re.findall(r"\S+", text or "")
+
+def chunk_words(words: list[str], size: int, overlap: int):
+    """Yield text chunks as strings with given size/overlap."""
+    if size <= 0:
+        raise ValueError("CHUNK_SIZE must be > 0")
+    step = max(1, size - max(0, overlap))
+    for start in range(0, len(words), step):
+        end = start + size
+        yield " ".join(words[start:end])
+
+def main():
+    df = pd.read_csv(INPUT_CSV)
+
+    rows = []
+    for _, r in df.iterrows():
+        doc_id    = r["doc_id"]
+        ftype     = r["file_type"]
+        needs_ocr = bool(r.get("needs_ocr", False))
+        text      = str(r.get("text_clean", "") or "")
+
+        # If OCR needed (blank clean text), keep a single empty chunk so it’s traceable
+        if needs_ocr or not text.strip():
+            rows.append({
+                "doc_id": doc_id,
+                "file_type": ftype,
+                "chunk_id": 0,
+                "word_count": 0,
+                "text_chunk": "",
+                "needs_ocr": needs_ocr,
+            })
+            continue
+
+        words = word_tokenize(text)
+        # Short docs → single chunk
+        if len(words) <= CHUNK_SIZE:
+            rows.append({
+                "doc_id": doc_id,
+                "file_type": ftype,
+                "chunk_id": 0,
+                "word_count": len(words),
+                "text_chunk": " ".join(words),
+                "needs_ocr": needs_ocr,
+            })
+            continue
+
+        # Long docs → overlapping chunks
+        for idx, chunk in enumerate(chunk_words(words, CHUNK_SIZE, OVERLAP)):
+            if not chunk:
+                continue
+            rows.append({
+                "doc_id": doc_id,
+                "file_type": ftype,
+                "chunk_id": idx,
+                "word_count": len(chunk.split()),
+                "text_chunk": chunk,
+                "needs_ocr": needs_ocr,
+            })
+
+    out = pd.DataFrame(rows)
+
+    # Save analysis-ready format (CSV)
+    Path(OUT_CSV).parent.mkdir(parents=True, exist_ok=True)
+    out.to_csv(OUT_CSV, index=False)
+
+    # Small, human-preview (no giant text / no newlines)
+    prev = out.copy()
+    prev["text_chunk"] = prev["text_chunk"].str.replace(r"[\r\n]+", " ", regex=True).str.slice(0, 400)
+    prev.to_csv(OUT_TSV, sep="\t", encoding="utf-8-sig", index=False)
+
+    print(f"Wrote {OUT_CSV} with {len(out)} chunk-rows "
+          f"(docs: {out['doc_id'].nunique()}, chunks/doc ~{len(out)/max(1,out['doc_id'].nunique()):.1f}).")
+    print(f"Preview: {OUT_TSV}")
+
+if __name__ == "__main__":
+    main()
