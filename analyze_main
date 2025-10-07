@@ -1,0 +1,20 @@
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--thresh", type=int, nargs="+", default=[80, 90],
+                        help="One or more thresholds, e.g., 80 90")
+    args = parser.parse_args()
+
+    # Fixed defaults, rely on run_dedupe's own defaults for min_df/ngrams/batch
+    chunks_csv = DATA_DIR / "corpus_chunks.csv"
+    clean_csv  = DATA_DIR / "corpus_clean.csv"
+    stages = ["dedupe", "complexity"]
+
+    for t_int in args.thresh:
+        t = float(t_int) / 100.0
+        out_dir = DATA_DIR / f"t{t_int}"
+
+        if "dedupe" in stages:
+            run_dedupe(chunks_csv, out_dir, t)  # use function defaults
+
+        if "complexity" in stages:
+            run_complexity(clean_csv, out_dir / "clusters.csv", out_dir)
