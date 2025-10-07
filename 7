@@ -1,0 +1,66 @@
+# ---------------------------------------------------------
+# 7_reporting_complexity.py
+# Combine clusters + complexity heuristics
+# ---------------------------------------------------------
+from pathlib import Path
+import re, numpy as np, pandas as pd
+
+CLEAN_CSV   = "data/corpus_clean.csv"
+CLUST_CSV   = "data/clusters.csv"
+OUT_COMPLEX = "data/doc_complexity.csv"
+OUT_SUMMARY = "data/executive_summary.txt"
+
+def count_conditionals(text):
+    return len(re.findall(r"\b(if|unless|provided|except|whereas)\b", text, flags=re.I))
+
+def count_statutes(text):
+    return len(re.findall(r"\b(ORS|U\.S\.C\.|§)\b", text))
+
+def avg_sentence_length(text):
+    sents = re.split(r"[.!?]", text)
+    words = [len(re.findall(r"\w+", s)) for s in sents if s.strip()]
+    return np.mean(words) if words else 0
+
+def complexity_score(row):
+    wc = row["word_count_clean"]
+    base = min(5, max(1, int(np.ceil(wc / 700))))   # 1–5 by length buckets
+    score = base
+    if row["cond_count"] > row["cond_avg"]: score += 1
+    if row["stat_count"] > row["stat_avg"]: score += 1
+    if row["sent_len"]  > row["sent_avg"]:  score += 1
+    return int(min(score, 5))
+
+def main():
+    df = pd.read_csv(CLEAN_CSV)
+    cl = pd.read_csv(CLUST_CSV)
+
+    df = df.merge(cl[["doc_id","cluster_id","cluster_size"]], on="doc_id", how="left")
+    df["cluster_size"].fillna(1, inplace=True)
+
+    df["cond_count"] = df["text_clean"].fillna("").apply(count_conditionals)
+    df["stat_count"] = df["text_clean"].fillna("").apply(count_statutes)
+    df["sent_len"]   = df["text_clean"].fillna("").apply(avg_sentence_length)
+    df["cond_avg"] = df["cond_count"].mean()
+    df["stat_avg"] = df["stat_count"].mean()
+    df["sent_avg"] = df["sent_len"].mean()
+    df["complexity"] = df.apply(complexity_score, axis=1)
+
+    df.to_csv(OUT_COMPLEX, index=False)
+
+    # Summary
+    total = len(df)
+    dupes = (df["cluster_size"] > 1).sum()
+    unique = total - dupes
+    avg_complex = df["complexity"].mean()
+
+    with open(OUT_SUMMARY, "w", encoding="utf-8") as f:
+        f.write(f"Total documents: {total}\n")
+        f.write(f"Unique clusters: {df['cluster_id'].nunique()}\n")
+        f.write(f"Docs with duplicates: {dupes} ({dupes/total:.1%})\n")
+        f.write(f"Average complexity: {avg_complex:.2f} (1=simple, 5=complex)\n")
+        f.write(f"Cluster size distribution:\n{df['cluster_size'].value_counts().head(10)}\n")
+
+    print(f"Wrote {OUT_COMPLEX} and {OUT_SUMMARY}")
+
+if __name__ == "__main__":
+    main()
