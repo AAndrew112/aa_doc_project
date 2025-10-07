@@ -1,0 +1,53 @@
+# src/orchestrate.py
+"""
+Simplified orchestrator.
+Runs the full pipeline (preprocess + analysis) with default settings,
+and lets you specify one or more thresholds.
+
+Example:
+python src/orchestrate.py --thresh 80 90
+"""
+
+from __future__ import annotations
+from pathlib import Path
+import argparse
+import preprocess as pp
+import analyze as az
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--thresh", type=int, nargs="+", default=[80, 90],
+                        help="Thresholds to run, e.g. 80 90")
+    args = parser.parse_args()
+
+    # Hard-coded defaults
+    root = Path("DOJ_DOCS")        # where your documents live
+    chunk_size = 900
+    overlap = 100
+    min_df = 2
+    ngrams = (1, 2)
+    batch = 1500
+    data = Path("data")
+
+    # --- Preprocessing ---
+    print("Running preprocessing...")
+    inv    = data / "inventory.csv"
+    raw    = data / "corpus_raw.csv"
+    clean  = data / "corpus_clean.csv"
+    chunks = data / "corpus_chunks.csv"
+
+    pp.stage_inventory(root, inv)
+    pp.stage_extract(inv, raw)
+    pp.stage_clean(raw, clean)
+    pp.stage_chunk(clean, chunks, chunk_size, overlap)
+
+    # --- Analysis for each threshold ---
+    print("Running analysis...")
+    for t_int in args.thresh:
+        t = float(t_int) / 100.0
+        out_dir = data / f"t{t_int}"
+        az.run_dedupe(chunks, out_dir, t, min_df=min_df, ngram_range=ngrams, batch=batch)
+        az.run_complexity(clean, out_dir / "clusters.csv", out_dir)
+
+if __name__ == "__main__":
+    main()
