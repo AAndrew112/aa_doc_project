@@ -1,0 +1,206 @@
+"""
+preprocess.py
+Stages: inventory -> extract -> clean -> chunk (CSV-only)
+
+Usage examples:
+  python src/preprocess.py --root DOJ_DOCS
+  python src/preprocess.py --run extract,clean,chunk
+"""
+
+from __future__ import annotations
+from pathlib import Path
+import argparse, csv, re, unicodedata
+import pandas as pd
+from docx import Document
+import pdfplumber
+
+DATA_DIR = Path("data")
+
+# ---------- helpers ----------
+def word_count(text: str) -> int:
+    return len(re.findall(r"\b\w+\b", text or ""))
+
+def normalize_unicode(text: str) -> str:
+    if not isinstance(text, str): return ""
+    return unicodedata.normalize("NFC", text)
+
+def collapse_ws(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
+
+def strip_lines_matching(text: str, patterns) -> str:
+    if not text: return ""
+    lines = text.splitlines()
+    compiled = [re.compile(p, re.I) for p in patterns]
+    kept = []
+    for ln in lines:
+        if any(c.search(ln) for c in compiled): continue
+        kept.append(ln)
+    return "\n".join(kept)
+
+def strip_boilerplate(text: str, phrases) -> str:
+    out = text
+    for ph in phrases:
+        out = re.sub(re.escape(ph), " ", out, flags=re.I)
+    return out
+
+def word_tokenize(text: str) -> list[str]:
+    return re.findall(r"\S+", text or "")
+
+def chunk_words(words: list[str], size: int, overlap: int):
+    if size <= 0: raise ValueError("CHUNK_SIZE must be > 0")
+    step = max(1, size - max(0, overlap))
+    for start in range(0, len(words), step):
+        end = start + size
+        yield " ".join(words[start:end])
+
+# ---------- stage fns ----------
+def stage_inventory(root: Path, out_csv: Path):
+    rows = []
+    for path in Path(root).rglob("*"):
+        if path.is_file():
+            rows.append({
+                "doc_id": str(path.relative_to(root)),
+                "file_type": path.suffix.lower().lstrip("."),
+                "file_path": str(path.resolve())
+            })
+    df = pd.DataFrame(rows)
+    out_csv.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(out_csv, index=False)
+    print(f"[inventory] wrote {out_csv} ({len(df)} files)")
+
+def extract_docx(path_str: str) -> str:
+    doc = Document(path_str)
+    return "\n".join(p.text for p in doc.paragraphs)
+
+def extract_pdf(path_str: str) -> str:
+    parts = []
+    with pdfplumber.open(path_str) as pdf:
+        for page in pdf.pages:
+            parts.append(page.extract_text() or "")
+    return "\n".join(parts).strip()
+
+def stage_extract(inv_csv: Path, out_csv: Path):
+    inv = pd.read_csv(inv_csv)
+    inv = inv[inv["file_type"].str.lower().isin(["docx","pdf","txt"])].copy()
+    rows = []
+    for _, r in inv.iterrows():
+        doc_id, ftype, fpath = r["doc_id"], r["file_type"].lower(), r["file_path"]
+        text_raw, error = "", ""
+        try:
+            if ftype == "docx": text_raw = extract_docx(fpath)
+            elif ftype == "pdf": text_raw = extract_pdf(fpath)
+            elif ftype == "txt":
+                with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
+                    text_raw = f.read()
+        except Exception as e:
+            error = f"{type(e).__name__}: {e}"
+            text_raw = ""
+        wc = word_count(text_raw)
+        needs_ocr = bool(ftype == "pdf" and wc < 15)
+        rows.append({
+            "doc_id": doc_id, "file_type": ftype,
+            "word_count": wc, "needs_ocr": needs_ocr,
+            "text_raw": text_raw, "error": error
+        })
+    df = pd.DataFrame(rows)
+    out_csv.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(out_csv, index=False)
+    print(f"[extract] wrote {out_csv} ({len(df)} rows) "
+          f"needs_ocr={int(df['needs_ocr'].sum())} errors={int(df['error'].astype(bool).sum())}")
+
+def stage_clean(raw_csv: Path, out_csv: Path,
+                header_patterns: list[str] | None = None,
+                boilerplate_phrases: list[str] | None = None):
+    if header_patterns is None:
+        header_patterns = [
+            r'^\s*(Oregon DOJ|Department of Justice)\b.*$',
+            r'^\s*Page\s*\d+\s*(of\s*\d+)?\s*$',
+        ]
+    if boilerplate_phrases is None:
+        boilerplate_phrases = [
+            "this document is confidential and intended only for the recipient",
+            "all rights reserved",
+            "oregon department of justice",
+        ]
+    df = pd.read_csv(raw_csv)
+    clean_mask = df["needs_ocr"] == False
+    def clean_one(t: str) -> str:
+        t = normalize_unicode(t or "")
+        t = t.lower()
+        t = strip_lines_matching(t, header_patterns)
+        t = strip_boilerplate(t, boilerplate_phrases)
+        t = collapse_ws(t)
+        return t
+    df.loc[clean_mask, "text_clean"] = df.loc[clean_mask, "text_raw"].apply(clean_one)
+    df.loc[~clean_mask, "text_clean"] = ""
+    df["word_count_clean"] = df["text_clean"].apply(word_count).astype("int64")
+    out_csv.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(out_csv, index=False)
+    # tiny TSV preview
+    prev = df.copy()
+    prev["text_clean"] = prev["text_clean"].str.replace(r"[\r\n]+"," ", regex=True).str.slice(0,500)
+    prev[["doc_id","file_type","needs_ocr","word_count","word_count_clean","text_clean"]]\
+        .to_csv(out_csv.with_name("corpus_clean_preview.tsv"),
+                sep="\t", encoding="utf-8-sig", index=False, quoting=csv.QUOTE_MINIMAL)
+    print(f"[clean] wrote {out_csv} ({len(df)} rows)")
+
+def stage_chunk(clean_csv: Path, out_csv: Path, chunk_size:int=900, overlap:int=100):
+    df = pd.read_csv(clean_csv)
+    rows = []
+    for _, r in df.iterrows():
+        doc_id, ftype = r["doc_id"], r["file_type"]
+        needs_ocr = bool(r.get("needs_ocr", False))
+        text = str(r.get("text_clean","") or "")
+        if needs_ocr or not text.strip():
+            rows.append({"doc_id": doc_id,"file_type": ftype,"chunk_id": 0,
+                         "word_count": 0,"text_chunk":"", "needs_ocr": needs_ocr})
+            continue
+        words = word_tokenize(text)
+        if len(words) <= chunk_size:
+            rows.append({"doc_id": doc_id,"file_type": ftype,"chunk_id": 0,
+                         "word_count": len(words),"text_chunk":" ".join(words),
+                         "needs_ocr": needs_ocr})
+            continue
+        for idx, ch in enumerate(chunk_words(words, chunk_size, overlap)):
+            if not ch: continue
+            rows.append({"doc_id": doc_id,"file_type": ftype,"chunk_id": idx,
+                         "word_count": len(ch.split()),"text_chunk": ch,
+                         "needs_ocr": needs_ocr})
+    out = pd.DataFrame(rows)
+    out_csv.parent.mkdir(parents=True, exist_ok=True)
+    out.to_csv(out_csv, index=False)
+    prev = out.copy()
+    prev["text_chunk"] = prev["text_chunk"].str.replace(r"[\r\n]+"," ", regex=True).str.slice(0,400)
+    prev.to_csv(out_csv.with_name("corpus_chunks_preview.tsv"),
+                sep="\t", encoding="utf-8-sig", index=False)
+    print(f"[chunk] wrote {out_csv} ({len(out)} chunk-rows, "
+          f"docs={out['doc_id'].nunique()}, chunks/doc~{len(out)/max(1,out['doc_id'].nunique()):.1f})")
+
+# ---------- CLI ----------
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--root", type=str, default=None, help="Top folder for inventory stage")
+    ap.add_argument("--run", type=str, default="inventory,extract,clean,chunk",
+                    help="Comma list of stages to run")
+    ap.add_argument("--chunk-size", type=int, default=900)
+    ap.add_argument("--overlap", type=int, default=100)
+    args = ap.parse_args()
+
+    stages = [s.strip().lower() for s in args.run.split(",") if s.strip()]
+    inv_csv   = DATA_DIR / "inventory.csv"
+    raw_csv   = DATA_DIR / "corpus_raw.csv"
+    clean_csv = DATA_DIR / "corpus_clean.csv"
+    chunks_csv= DATA_DIR / "corpus_chunks.csv"
+
+    if "inventory" in stages:
+        if not args.root: raise SystemExit("--root is required for inventory")
+        stage_inventory(Path(args.root), inv_csv)
+    if "extract" in stages:
+        stage_extract(inv_csv, raw_csv)
+    if "clean" in stages:
+        stage_clean(raw_csv, clean_csv)
+    if "chunk" in stages:
+        stage_chunk(clean_csv, chunks_csv, args.chunk_size, args.overlap)
+
+if __name__ == "__main__":
+    main()
