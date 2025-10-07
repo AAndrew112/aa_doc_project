@@ -1,0 +1,107 @@
+# ---------------------------------------------------------
+# 6_complexity_scoring.py
+# Compute a simple 1–5 complexity score per DOCUMENT.
+# Input:  data/corpus_clean.csv (has text_clean per doc)
+# Output: data/complexity.csv
+# ---------------------------------------------------------
+
+from pathlib import Path
+import re
+import pandas as pd
+
+IN_CSV  = "data/corpus_clean.csv"
+OUT_CSV = "data/complexity.csv"
+
+# Tweak lists/patterns as you learn your corpus
+CONDITIONAL_TERMS = [
+    "if", "unless", "provided that", "except", "notwithstanding", "subject to"
+]
+STATUTE_PATTERNS = [
+    r"\bORS\s*\d+[.\d]*",      # Oregon Revised Statutes
+    r"\bU\.S\.C\.",            # U.S. Code
+    r"\bUSC\b",
+]
+
+def readability_proxy(text: str) -> float:
+    """
+    Very lightweight Flesch-like proxy:
+    - words per sentence (wps)
+    - syllables per word (spw) via vowel groups
+    Returns higher = easier. Lower = harder.
+    """
+    t = text or ""
+    words = re.findall(r"\b\w+\b", t)
+    sents = re.split(r"[.!?]+[\s)]*", t)
+    sents = [s for s in sents if s.strip()]
+    if not words or not sents:
+        return 0.0
+    wps = len(words) / max(1, len(sents))
+    syllables = sum(len(re.findall(r"[aeiouy]+", w, flags=re.I)) for w in words)
+    spw = syllables / max(1, len(words))
+    # Flesch Reading Ease: 206.835 − 1.015*wps − 84.6*spw
+    return 206.835 - 1.015 * wps - 84.6 * spw
+
+def count_conditional_terms(text: str) -> int:
+    t = text or ""
+    total = 0
+    for term in CONDITIONAL_TERMS:
+        total += len(re.findall(fr"\b{re.escape(term)}\b", t, flags=re.I))
+    return total
+
+def count_statute_refs(text: str) -> int:
+    t = text or ""
+    return sum(len(re.findall(pat, t, flags=re.I)) for pat in STATUTE_PATTERNS)
+
+def bucket_complexity(length: int, read_score: float, cond_hits: int, statute_hits: int) -> int:
+    """
+    Map signals to a simple 1–5 bucket (1 simplest).
+    Tweak thresholds as needed.
+    """
+    score = 0
+    # Length (tokens)
+    score += 0 if length < 400 else 1 if length < 1200 else 2
+    # Readability (higher easier)
+    score += 2 if read_score < 30 else 1 if read_score < 60 else 0
+    # Conditionals/statutes add complexity
+    score += 1 if cond_hits > 5 else 0
+    score += 1 if statute_hits > 2 else 0
+    return max(1, min(5, score + 1))
+
+def main():
+    df = pd.read_csv(IN_CSV)
+
+    # Expect one row per doc with text_clean (from your previous step)
+    needed = {"doc_id", "text_clean"}
+    missing = needed - set(df.columns)
+    if missing:
+        raise ValueError(f"Missing required columns in {IN_CSV}: {missing}")
+
+    rows = []
+    for _, r in df.iterrows():
+        doc_id = r["doc_id"]
+        text   = str(r.get("text_clean", "") or "")
+
+        length = len(re.findall(r"\b\w+\b", text))
+        read   = readability_proxy(text)
+        cond   = count_conditional_terms(text)
+        stat   = count_statute_refs(text)
+        bucket = bucket_complexity(length, read, cond, stat)
+
+        rows.append({
+            "doc_id": doc_id,
+            "word_count": int(length),
+            "readability_proxy": float(read),
+            "conditional_hits": int(cond),
+            "statute_hits": int(stat),
+            "complexity_bucket_1to5": int(bucket),
+        })
+
+    out = pd.DataFrame(rows)
+    Path(OUT_CSV).parent.mkdir(parents=True, exist_ok=True)
+    out.to_csv(OUT_CSV, index=False)
+
+    print(f"Wrote {OUT_CSV} with {len(out)} rows.")
+    print(out["complexity_bucket_1to5"].value_counts().sort_index())
+
+if __name__ == "__main__":
+    main()
