@@ -1,0 +1,104 @@
+# src/orchestrate.py
+"""
+orchestrate.py
+---------------
+This script lets you run the entire DOJ document pipeline in one command.
+
+It can:
+  1) Run ALL preprocessing steps (inventory → extract → clean → chunk)
+     AND then run analysis (dedupe + complexity)
+  2) Or, skip straight to analysis if you already have the preprocessed CSVs.
+
+USAGE EXAMPLES
+--------------
+# Run full pipeline (from raw docs to analysis)
+python src/orchestrate.py --mode full --root DOJ_DOCS
+
+# Only run analysis for threshold 88 (uses existing data/corpus_* files)
+python src/orchestrate.py --mode analyze --thresh 88
+"""
+
+from __future__ import annotations
+from pathlib import Path
+import argparse
+
+# Import your two existing scripts so we can call their functions directly
+import preprocess as pp
+import analyze as az
+
+# ---------- Helper: Run all preprocessing steps ----------
+def run_full(root: Path, chunk_size: int, overlap: int):
+    """Run inventory → extract → clean → chunk (saves results in /data)."""
+    data = pp.DATA_DIR
+    inv    = data / "inventory.csv"
+    raw    = data / "corpus_raw.csv"
+    clean  = data / "corpus_clean.csv"
+    chunks = data / "corpus_chunks.csv"
+
+    # Step 1: Find all files and record their paths and types
+    pp.stage_inventory(Path(root), inv)
+
+    # Step 2: Extract text from DOCX, PDF, TXT files
+    pp.stage_extract(inv, raw)
+
+    # Step 3: Clean the text (normalize, lowercase, remove headers/footers)
+    pp.stage_clean(raw, clean)
+
+    # Step 4: Split long docs into overlapping text chunks
+    pp.stage_chunk(clean, chunks, chunk_size=chunk_size, overlap=overlap)
+
+
+# ---------- Helper: Run analysis only ----------
+def run_analysis(thresh: list[int], min_df: int, ngrams: tuple[int, int], batch: int):
+    """Run deduplication + complexity analysis for one or more thresholds."""
+    data = az.DATA_DIR
+    chunks = data / "corpus_chunks.csv"
+    clean  = data / "corpus_clean.csv"
+
+    # Sanity check: make sure preprocessing outputs exist
+    if not chunks.exists() or not clean.exists():
+        raise SystemExit("Missing inputs. Run full pipeline first or provide the CSVs manually.")
+
+    # Loop through each threshold (e.g., 80, 85, 90)
+    for t_int in thresh:
+        t = float(t_int) / 100.0  # Convert 80 → 0.80
+        out_dir = data / f"t{t_int}"  # Each threshold gets its own folder (data/t80/, etc.)
+
+        # Step 1: Find duplicate or near-duplicate documents
+        az.run_dedupe(chunks, out_dir, t, min_df=min_df, ngram_range=ngrams, batch=batch)
+
+        # Step 2: Assign a simple 1–5 "complexity" score to each document
+        az.run_complexity(clean, out_dir / "clusters.csv", out_dir)
+
+
+# ---------- Command-line entry point ----------
+def main():
+    """Parse user options and decide which pipeline parts to run."""
+    p = argparse.ArgumentParser()
+    p.add_argument("--mode", choices=["full", "analyze"], default="full",
+                   help="'full' = run preprocessing + analysis, 'analyze' = analysis only")
+    p.add_argument("--root", type=str, help="Top folder containing your documents (required for full mode)")
+    p.add_argument("--thresh", type=int, nargs="+", default=[80, 90],
+                   help="Similarity thresholds to test, e.g., 80 90")
+    p.add_argument("--chunk-size", type=int, default=900, help="Words per text chunk (default 900)")
+    p.add_argument("--overlap", type=int, default=100, help="Word overlap between chunks (default 100)")
+    p.add_argument("--min-df", type=int, default=2, help="Ignore terms appearing in fewer than N docs")
+    p.add_argument("--ngrams", type=str, default="1,2", help="Use 1-grams, 2-grams, etc. (default '1,2')")
+    p.add_argument("--batch", type=int, default=1500, help="Similarity computation batch size")
+    args = p.parse_args()
+
+    # Convert "1,2" → (1, 2)
+    ngrams = tuple(int(x) for x in args.ngrams.split(","))
+
+    # Run the chosen pipeline mode
+    if args.mode == "full":
+        if not args.root:
+            raise SystemExit("--root is required for mode=full")
+        run_full(Path(args.root), args.chunk_size, args.overlap)
+        run_analysis(args.thresh, args.min_df, ngrams, args.batch)
+    else:
+        run_analysis(args.thresh, args.min_df, ngrams, args.batch)
+
+
+if __name__ == "__main__":
+    main()
