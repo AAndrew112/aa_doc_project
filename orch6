@@ -1,0 +1,44 @@
+from __future__ import annotations
+from pathlib import Path
+import argparse
+import pandas as pd
+
+from . import preprocess as pp
+from . import analyze as az
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--root", type=str, required=True, help="Folder with your .pdf/.docx/.txt")
+    p.add_argument("--thresh", type=int, nargs="+", default=[80, 90], help="Thresholds, e.g. 80 90")
+    args = p.parse_args()
+
+    root = Path(args.root)
+    data = Path("data")
+    data.mkdir(parents=True, exist_ok=True)
+
+    inv    = data / "inventory.csv"
+    raw    = data / "corpus_raw.csv"
+    clean  = data / "corpus_clean.csv"
+    chunks = data / "corpus_chunks.csv"
+
+    print("Running preprocessing...")
+    pp.stage_inventory(root, inv)
+
+    # stop early if inventory is empty
+    if not inv.exists() or pd.read_csv(inv).empty:
+        print("[orchestrate] No supported files found under --root. Check path and file types.")
+        return
+
+    pp.stage_extract(inv, raw)
+    pp.stage_clean(raw, clean)
+    pp.stage_chunk(clean, chunks, chunk_size=900, overlap=100)
+
+    print("Running analysis...")
+    for t_int in args.thresh:
+        t = float(t_int) / 100.0
+        out_dir = data / f"t{t_int}"
+        az.run_dedupe(chunks, out_dir, t, min_df=2, ngram_range=(1, 2), batch=1500)
+        az.run_complexity(clean, out_dir / "clusters.csv", out_dir)
+
+if __name__ == "__main__":
+    main()
