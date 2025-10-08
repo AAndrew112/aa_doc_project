@@ -1,105 +1,130 @@
-
 # analyze.py
 """
-This script runs the *analysis* stages after preprocessing:
-  1) Dedupe: Finds similar documents using TF-IDF and cosine similarity,
-     then groups them into clusters.
-  2) Complexity: Assigns each document a 1–5 complexity score based on
-     length and language features.
+Purpose
+-------
+Analyze preprocessed documents in two stages:
+  1) Dedupe: compute TF-IDF + cosine similarity, keep pairs ≥ threshold,
+     and group docs into clusters (connected components).
+  2) Complexity (optional): compute a rough 1–5 score per doc.
 
-All output files include the threshold (tXX) and timestamp in their names.
-A single combined report per threshold is written to: report_tXX__YYYYMMDD_HHMM.txt
+Key behavior
+------------
+• Filenames include both the threshold and a timestamp:
+    e.g., clusters_t80__YYYYMMDD_HHMM.csv
+• A single combined, human-readable report is written per threshold:
+    report_t80__YYYYMMDD_HHMM.txt
+• No run_manifest.json is produced (kept simple and human-oriented).
+
+Usage (if running this file directly)
+-------------------------------------
+py analyze.py --thresh 80 90
+(Or call run_dedupe / run_complexity from orchestrate.py, which is recommended.)
 """
 
 from __future__ import annotations
 from pathlib import Path
-import argparse, json, re, datetime
+import argparse
+import re
+import datetime
 import numpy as np
 import pandas as pd
-from sklearn.feature_extraction.text import TfidfVectorizer   # Converts text to numerical form
-from sklearn.metrics.pairwise import cosine_similarity        # Measures similarity between texts
+from sklearn.feature_extraction.text import TfidfVectorizer   # text → numeric features
+from sklearn.metrics.pairwise import cosine_similarity         # cosine between vectors
 
-DATA_DIR = Path("data")  # Default output folder
+DATA_DIR = Path("data")  # default output root
 
 
-# ---------- Helper: build clusters from pairs ----------
-def clusters_from_pairs(pairs, ids):
+# ---------- Helper: union-find to turn pairs into clusters ----------
+def clusters_from_pairs(pairs: list[tuple[str, str]], ids: list[str]) -> list[list[str]]:
     """
-    Turn document pairs into clusters using the 'union-find' algorithm.
-    If A~B and B~C, all three go into the same cluster even if A~C wasn't directly compared.
+    Convert pairwise links (A~B) into connected components (clusters).
+    If A~B and B~C, A,B,C land in the same cluster (even if A~C wasn't directly scored).
     """
-    parent = {i: i for i in ids}  # Each doc starts as its own parent
+    parent = {i: i for i in ids}  # start with each doc as its own parent
 
-    def find(x):  # Finds the 'root' parent of a document
+    def find(x: str) -> str:
+        # Follow parent pointers to the root; compress path for speed
         while parent[x] != x:
-            parent[x] = parent[parent[x]]  # Path compression for speed
+            parent[x] = parent[parent[x]]
             x = parent[x]
         return x
 
-    def union(a, b):  # Joins two documents under one parent
+    def union(a: str, b: str) -> None:
         ra, rb = find(a), find(b)
         if ra != rb:
             parent[rb] = ra
 
-    for a, b in pairs:  # Link all similar pairs
+    for a, b in pairs:
         union(a, b)
 
-    groups = {}
+    groups: dict[str, list[str]] = {}
     for i in ids:
         root = find(i)
-        groups.setdefault(root, []).append(i)  # Add doc to its cluster
+        groups.setdefault(root, []).append(i)
     return list(groups.values())
 
 
 # ---------- Stage 1: DEDUPE ----------
-def run_dedupe(chunks_csv: Path, out_dir: Path, thresh_float: float,
-               min_df: int = 2, ngram_range=(1, 2), batch: int = 1500):
+def run_dedupe(
+    chunks_csv: Path,
+    out_dir: Path,
+    thresh_float: float,
+    min_df: int = 2,
+    ngram_range: tuple[int, int] = (1, 2),
+    batch: int = 1500,
+) -> dict[str, Path]:
     """
-    Step 1: Identify similar documents and group them into clusters.
-    Returns paths to the created clusters CSV and report.
+    Find similar documents and build clusters.
+
+    Returns
+    -------
+    dict with:
+      'clusters_csv' : Path to clusters CSV (timestamped)
+      'report_path'  : Path to the combined report (started here)
+      'pairs_csv'    : Path to similar pairs CSV (timestamped)
     """
     out_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M")
-    t_int = int(thresh_float * 100)
-    t_suffix = f"t{t_int}__{timestamp}"  # Used to tag all output filenames
+    t_int = int(thresh_float * 100)                     # e.g., 0.80 → 80
+    suffix = f"t{t_int}__{timestamp}"                   # used in all filenames
 
-    # 1. Read document chunks and merge them back into full documents
+    # 1) Rebuild full documents from chunks (group by doc_id and join text)
     df = pd.read_csv(chunks_csv)
     if not {"doc_id", "text_chunk"}.issubset(df.columns):
         raise ValueError("chunks CSV must include 'doc_id' and 'text_chunk'")
     docs = (
         df.groupby("doc_id", sort=False)["text_chunk"]
-          .apply(lambda s: " ".join(map(str, s.fillna(""))))  # Join all chunks
+          .apply(lambda s: " ".join(map(str, s.fillna(""))))  # join chunks → one string per doc
           .reset_index()
     )
-    ids = docs["doc_id"].tolist()
-    texts = docs["text_chunk"].fillna("").tolist()
+    ids: list[str] = docs["doc_id"].tolist()
+    texts: list[str] = docs["text_chunk"].fillna("").tolist()
     n = len(ids)
 
-    # 2. Convert text to numeric form using TF-IDF
+    # 2) Vectorize text with TF-IDF (unigrams + bigrams, english stopwords)
     vect = TfidfVectorizer(stop_words="english", ngram_range=ngram_range, min_df=min_df)
-    X = vect.fit_transform(texts)  # Sparse matrix representing each doc
+    X = vect.fit_transform(texts)  # sparse matrix, memory-efficient
 
-    # 3. Compare documents in batches to save memory
-    pairs = []
+    # 3) Compute cosine similarities in batches (avoid dense n×n matrix)
+    pairs: list[tuple[str, str, float]] = []
     for start in range(0, n, batch):
         end = min(start + batch, n)
-        sims = cosine_similarity(X[start:end], X)  # Compute similarity block
+        sims = cosine_similarity(X[start:end], X)  # block vs all docs
         for i in range(end - start):
             gi = start + i
             row = sims[i]
-            for j in range(gi + 1, n):  # Compare only upper triangle (no repeats)
+            for j in range(gi + 1, n):            # upper triangle only (skip self + dupes)
                 s = row[j]
-                if s >= thresh_float:   # Keep only if above threshold
+                if s >= thresh_float:
                     pairs.append((ids[gi], ids[j], float(s)))
 
-    # 4. Save all similar document pairs
+    # 4) Save all qualifying pairs (A,B,similarity) for auditability
     pairs_df = pd.DataFrame(pairs, columns=["doc_id_a", "doc_id_b", "similarity"]) \
                  .sort_values("similarity", ascending=False)
-    pairs_path = out_dir / f"similar_pairs_{t_suffix}.csv"
+    pairs_path = out_dir / f"similar_pairs_{suffix}.csv"
     pairs_df.to_csv(pairs_path, index=False)
 
-    # 5. Convert pairs into clusters
+    # 5) Build clusters (connected components) from pair links
     comps = clusters_from_pairs([(a, b) for a, b, _ in pairs], ids) if pairs else [[i] for i in ids]
     rows = []
     for cid, members in enumerate(sorted(comps, key=len, reverse=True), start=1):
@@ -107,100 +132,112 @@ def run_dedupe(chunks_csv: Path, out_dir: Path, thresh_float: float,
             rows.append({"cluster_id": cid, "doc_id": m, "cluster_size": len(members)})
     clust_df = pd.DataFrame(rows)
 
-    # 6. Add average similarity per cluster
+    # 6) Add average intra-cluster similarity (mean of pair scores within cluster)
     if not pairs_df.empty:
         doc_to_cluster = clust_df.set_index("doc_id")["cluster_id"].to_dict()
-        pairs_df["cluster_id"] = pairs_df["doc_id_a"].map(doc_to_cluster)
-        rel = pairs_df.groupby("cluster_id")["similarity"].mean().reset_index() \
-                      .rename(columns={"similarity": "avg_similarity"})
+        pairs_df["cluster_id"] = pairs_df["doc_id_a"].map(doc_to_cluster)  # map by A's cluster
+        # average similarity per cluster id
+        rel = (
+            pairs_df.groupby("cluster_id")["similarity"]
+                    .mean().reset_index().rename(columns={"similarity": "avg_similarity"})
+        )
         clust_df = clust_df.merge(rel, on="cluster_id", how="left")
     clust_df["avg_similarity"] = clust_df["avg_similarity"].fillna(0.0)
 
-    clusters_path = out_dir / f"clusters_{t_suffix}.csv"
+    clusters_path = out_dir / f"clusters_{suffix}.csv"
     clust_df.to_csv(clusters_path, index=False)
 
-    # 7. Create summary report and manifest
-    redundant_docs = set(pairs_df["doc_id_a"]).union(set(pairs_df["doc_id_b"])) if not pairs_df.empty else set()
+    # 7) Human-readable summary report (no JSON manifest)
+    redundant_docs = (
+        set(pairs_df["doc_id_a"]).union(set(pairs_df["doc_id_b"]))
+        if not pairs_df.empty else set()
+    )
     summary = {
         "docs_compared": n,
-        "pairs_ge_thresh": len(pairs_df),
-        "redundant_docs": len(redundant_docs),
+        "pairs_ge_thresh": int(len(pairs_df)),
+        "redundant_docs": int(len(redundant_docs)),
         "redundancy_pct": (len(redundant_docs) / max(1, n)) * 100.0,
-        "clusters": clust_df["cluster_id"].nunique(),
-        "largest_cluster": clust_df["cluster_size"].max(),
-        "mean_cluster_relatedness": float(clust_df.drop_duplicates("cluster_id")["avg_similarity"].mean())
+        "clusters": int(clust_df["cluster_id"].nunique()),
+        "largest_cluster": int(clust_df["cluster_size"].max()),
+        "mean_cluster_relatedness": float(
+            clust_df.drop_duplicates("cluster_id")["avg_similarity"].mean()
+        ),
     }
 
-    report_path = out_dir / f"report_{t_suffix}.txt"
+    report_path = out_dir / f"report_{suffix}.txt"
     with open(report_path, "w", encoding="utf-8") as f:
         f.write("[SIMILARITY SUMMARY]\n")
         for k, v in summary.items():
             f.write(f"{k}: {v}\n")
 
-    # Save machine-readable manifest for traceability
-    (out_dir / f"run_manifest_{t_suffix}.json").write_text(
-        json.dumps({
-            "stage": "dedupe",
-            "thresh": thresh_float,
-            "summary": summary
-        }, indent=2),
-        encoding="utf-8"
-    )
-
-    print(f"[dedupe {t_suffix}] pairs={len(pairs_df)} clusters={summary['clusters']}")
-    return {"clusters_csv": clusters_path, "report_path": report_path}
+    print(f"[dedupe {suffix}] pairs={len(pairs_df)} clusters={summary['clusters']}")
+    return {"clusters_csv": clusters_path, "report_path": report_path, "pairs_csv": pairs_path}
 
 
-# ---------- Stage 2: COMPLEXITY ----------
-def count_conditionals(text): return len(re.findall(r"\b(if|unless|provided|except|whereas)\b", text, flags=re.I))
-def count_statutes(text):     return len(re.findall(r"\b(ORS|U\.S\.C\.|§)\b", text))
-def avg_sentence_length(text):
-    """Approximate sentence complexity by counting average words per sentence."""
+# ---------- Stage 2: COMPLEXITY (optional) ----------
+# Note: You said you might skip complexity. This function remains available
+# for ad-hoc runs or future needs, but your orchestrator can simply not call it.
+
+def count_conditionals(text: str) -> int:
+    return len(re.findall(r"\b(if|unless|provided|except|whereas)\b", text, flags=re.I))
+
+def count_statutes(text: str) -> int:
+    return len(re.findall(r"\b(ORS|U\.S\.C\.|§)\b", text))
+
+def avg_sentence_length(text: str) -> float:
+    """Simple proxy for readability: average words per sentence."""
     sents = re.split(r"[.!?]", text)
     words = [len(re.findall(r"\w+", s)) for s in sents if s.strip()]
     return float(np.mean(words)) if words else 0.0
 
-def run_complexity(clean_csv: Path, clusters_csv: Path, out_dir: Path, report_path: Path | None = None):
+def run_complexity(clean_csv: Path, clusters_csv: Path, out_dir: Path, report_path: Path | None = None) -> Path:
     """
-    Step 2: Rate each document’s complexity (1–5 scale).
-    Joins results with clusters and appends findings to the combined report.
+    Compute a 1–5 complexity score per doc, join with clusters, and
+    append a short section to the existing report. Returns the report path.
     """
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Use clusters filename (which has timestamp/threshold) for consistent naming
-    stem = Path(clusters_csv).stem
-    suffix = stem.replace("clusters_", "")  # e.g., "t80__20251008_1345"
+    # Derive suffix from clusters filename to keep names consistent
+    stem = Path(clusters_csv).stem                 # e.g., "clusters_t80__20251008_1345"
+    suffix = stem.replace("clusters_", "")        # → "t80__20251008_1345"
 
-    # Load data
+    # Load cleaned texts and cluster assignments
     df = pd.read_csv(clean_csv)
     cl = pd.read_csv(clusters_csv)
     df = df.merge(cl[["doc_id", "cluster_id", "cluster_size"]], on="doc_id", how="left")
     df["cluster_size"].fillna(1, inplace=True)
 
-    # Count features that roughly correlate with complexity
+    # Count basic features that track with complexity
     df["cond_count"] = df["text_clean"].fillna("").apply(count_conditionals)
     df["stat_count"] = df["text_clean"].fillna("").apply(count_statutes)
     df["sent_len"]   = df["text_clean"].fillna("").apply(avg_sentence_length)
 
-    # Compute dataset averages for comparison
+    # Corpus averages for comparison
     df["cond_avg"] = df["cond_count"].mean()
     df["stat_avg"] = df["stat_count"].mean()
     df["sent_avg"] = df["sent_len"].mean()
 
-    # Scoring: longer, more technical docs get higher complexity
-    def complexity_score(row):
-        wc = row["word_count_clean"]
-        base = min(5, max(1, int(np.ceil(wc / 700))))  # 1 point per ~700 words
+    # Score: base on length, +1 for above-average legalese / sentence length
+    def complexity_score(row) -> int:
+        wc = row.get("word_count_clean", 0)
+        base = min(5, max(1, int(np.ceil(wc / 700))))  # ~1 point per 700 words
         score = base
         if row["cond_count"] > row["cond_avg"]: score += 1
         if row["stat_count"] > row["stat_avg"]: score += 1
         if row["sent_len"]  > row["sent_avg"]:  score += 1
-        return int(min(score, 5))  # cap at 5
+        return int(min(score, 5))
 
     df["complexity"] = df.apply(complexity_score, axis=1)
     df.to_csv(out_dir / f"doc_complexity_{suffix}.csv", index=False)
 
-    # Build summary for the report
+    # Append a concise section to the same threshold report
+    if report_path and Path(report_path).exists():
+        rp = Path(report_path)
+        header = "\n[COMPLEXITY SUMMARY]\n"
+    else:
+        rp = out_dir / f"report_{suffix}.txt"
+        header = "[COMPLEXITY SUMMARY]\n"
+
     exec_summary = (
         f"Total documents: {len(df)}\n"
         f"Unique clusters: {df['cluster_id'].nunique()}\n"
@@ -210,39 +247,4 @@ def run_complexity(clean_csv: Path, clusters_csv: Path, out_dir: Path, report_pa
         f"Cluster size distribution (top):\n{df['cluster_size'].value_counts().head(10)}\n"
     )
 
-    # Append to report started in run_dedupe
-    if report_path and Path(report_path).exists():
-        mode, header = "a", "\n[COMPLEXITY SUMMARY]\n"
-        rp = Path(report_path)
-    else:
-        mode, header = "w", "[COMPLEXITY SUMMARY]\n"
-        rp = out_dir / f"report_{suffix}.txt"
-
-    with open(rp, mode, encoding="utf-8") as f:
-        f.write(header)
-        f.write(exec_summary)
-
-    print(f"[complexity {suffix}] wrote doc_complexity and report")
-
-
-# ---------- CLI entry point ----------
-def main():
-    """Allows running analyze.py directly from the command line."""
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--thresh", type=int, nargs="+", default=[80, 90],
-                        help="Thresholds to test, e.g., 80 90")
-    parser.add_argument("--chunks", type=str, default="data/corpus_chunks.csv")
-    parser.add_argument("--clean", type=str, default="data/corpus_clean.csv")
-    args = parser.parse_args()
-
-    chunks_csv = Path(args.chunks)
-    clean_csv  = Path(args.clean)
-
-    for t_int in args.thresh:
-        t = float(t_int) / 100.0
-        out_dir = DATA_DIR / f"t{t_int}"
-        res = run_dedupe(chunks_csv, out_dir, t)  # Deduplication step
-        run_complexity(clean_csv, res["clusters_csv"], out_dir, report_path=res["report_path"])  # Complexity step
-
-if __name__ == "__main__":
-    main()
+    with open(rp, "a" if rp.exists()
