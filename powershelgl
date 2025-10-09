@@ -1,0 +1,23 @@
+$folder = "C:\Temp\DOJ_docs"   # <- change this
+
+$word = New-Object -ComObject Word.Application
+$word.Visible = $false
+$word.DisplayAlerts = 0
+
+Get-ChildItem -Path $folder -Recurse -File |
+  Where-Object { $_.Extension -ieq ".doc" -and $_.Name -notlike "~$*" } |
+  ForEach-Object {
+    $out = $_.FullName + "x"  # adds the x, turns file.doc into file.docx
+    if (Test-Path $out) { Write-Host "Skip, already exists:" $_.FullName; return }
+    try {
+      $doc = $word.Documents.Open($_.FullName)
+      $doc.SaveAs([ref] $out, [ref] 16)  # 16 = DOCX
+      $doc.Close()
+      Write-Host "Converted:" $_.FullName
+    } catch {
+      Write-Warning "Failed:" $_.FullName
+    }
+  }
+
+$word.Quit()
+Write-Host "Done."
