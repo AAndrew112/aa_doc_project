@@ -6,24 +6,40 @@ import sys
 from datetime import datetime
 from docx import Document
 
-def extract_text_and_highlight_count(path: Path, include_tables: bool, include_hf: bool):
+def extract_text_and_highlight_blocks(path: Path, include_tables: bool, include_hf: bool, merge_across_paragraphs: bool):
     """
-    Return:
-      - text (paragraphs [+ optional tables, headers/footers])
-      - highlight_count (number of runs with highlight color set)
+    Returns:
+      - text: concatenated document text (paragraphs [+ optional tables, headers/footers])
+      - highlight_blocks: number of contiguous highlighted blocks
+        * By default, merges adjacent highlighted runs WITHIN a paragraph.
+        * If merge_across_paragraphs=True, also merges when a paragraph ends highlighted and the next begins highlighted.
     """
     doc = Document(path)
     chunks = []
-    highlight_count = 0
+    highlight_blocks = 0
+
+    # Carry state for cross-paragraph merging
+    carry_in_block = False if merge_across_paragraphs else None
 
     def add_paragraphs(paragraphs):
-        nonlocal highlight_count
+        nonlocal highlight_blocks, carry_in_block
         for p in paragraphs:
             if p.text:
                 chunks.append(p.text)
+
+            in_block = bool(carry_in_block) if merge_across_paragraphs else False
+
             for r in p.runs:
-                if r.font and r.font.highlight_color:
-                    highlight_count += 1
+                is_hl = bool(r.font and r.font.highlight_color)
+                if is_hl and not in_block:
+                    highlight_blocks += 1      # start of a new contiguous block
+                    in_block = True
+                elif not is_hl and in_block:
+                    in_block = False
+
+            # Pass along state across paragraphs only if requested
+            if merge_across_paragraphs:
+                carry_in_block = in_block
 
     # Body paragraphs
     add_paragraphs(doc.paragraphs)
@@ -51,7 +67,7 @@ def extract_text_and_highlight_count(path: Path, include_tables: bool, include_h
                         for cell in row.cells:
                             add_paragraphs(cell.paragraphs)
 
-    return "\n".join(chunks), highlight_count
+    return "\n".join(chunks), highlight_blocks
 
 def count_pairs_and_empty(text: str):
     """
@@ -78,7 +94,7 @@ def timestamped_outpath(out_path: Path) -> Path:
 
 def main():
     p = argparse.ArgumentParser(
-        description="Scan .docx recursively; count bracket pairs (incl. empty); count highlighted runs; write CSV."
+        description="Scan .docx recursively; count bracket pairs (incl. empty); count highlighted blocks; write CSV."
     )
     p.add_argument("--root", type=Path, required=True, help="Root folder to search.")
     p.add_argument("--out", type=Path, default=Path("docx_bracket_counts.csv"),
@@ -87,6 +103,8 @@ def main():
     p.add_argument("--no-headers-footers", action="store_true", help="Exclude headers/footers.")
     p.add_argument("--no-timestamp", action="store_true",
                    help="Do NOT append timestamp to output filename.")
+    p.add_argument("--merge-across-paragraphs", action="store_true",
+                   help="Merge contiguous highlighted blocks across paragraph boundaries (stricter merging).")
     args = p.parse_args()
 
     if not args.root.exists():
@@ -103,17 +121,18 @@ def main():
     results = []
     total = len(files)
 
+    headers = [
+        "File Path",
+        "Bracket Pairs",
+        "Empty Pairs",
+        "Non-Empty Pairs",
+        "Highlight Count",
+        "Total Tags (with empty brackets)",
+        "Total Tags (no empty brackets)"
+    ]
+
     if total == 0:
         Path(out_path).parent.mkdir(parents=True, exist_ok=True)
-        headers = [
-            "File Path",
-            "Bracket Pairs",
-            "Empty Pairs",
-            "Non-Empty Pairs",
-            "Highlight Count",
-            "Total Tags (with empty brackets)",
-            "Total Tags (no empty brackets)"
-        ]
         with open(out_path, "w", newline="", encoding="utf-8") as fp:
             writer = csv.DictWriter(fp, fieldnames=headers)
             writer.writeheader()
@@ -126,21 +145,22 @@ def main():
 
     for idx, f in enumerate(files, start=1):
         try:
-            text, highlight_count = extract_text_and_highlight_count(f, include_tables, include_hf)
+            text, highlight_blocks = extract_text_and_highlight_blocks(
+                f, include_tables, include_hf, merge_across_paragraphs=args.merge_across_paragraphs
+            )
             pairs, empty_pairs = count_pairs_and_empty(text)
             non_empty_pairs = pairs - empty_pairs
 
-            # Totals: treat highlights as tag-like items
-            total_with_empty = max(pairs, highlight_count)
-            total_no_empty = max(non_empty_pairs, highlight_count)
-
+            # NEW total rules: take the higher of the two
+            total_with_empty = max(pairs, highlight_blocks)          # Bracket Pairs vs Highlight Count
+            total_no_empty = max(non_empty_pairs, highlight_blocks)  # Non-Empty Pairs vs Highlight Count
 
             results.append({
                 "File Path": str(f),
                 "Bracket Pairs": pairs,
                 "Empty Pairs": empty_pairs,
                 "Non-Empty Pairs": non_empty_pairs,
-                "Highlight Count": highlight_count,
+                "Highlight Count": highlight_blocks,
                 "Total Tags (with empty brackets)": total_with_empty,
                 "Total Tags (no empty brackets)": total_no_empty
             })
@@ -167,15 +187,6 @@ def main():
 
     # Write CSV
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
-    headers = [
-        "File Path",
-        "Bracket Pairs",
-        "Empty Pairs",
-        "Non-Empty Pairs",
-        "Highlight Count",
-        "Total Tags (with empty brackets)",
-        "Total Tags (no empty brackets)"
-    ]
     with open(out_path, "w", newline="", encoding="utf-8") as fp:
         writer = csv.DictWriter(fp, fieldnames=headers)
         writer.writeheader()
