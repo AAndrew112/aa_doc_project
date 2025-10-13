@@ -1,0 +1,132 @@
+#!/usr/bin/env python3
+from pathlib import Path
+import argparse
+import csv
+import sys
+from datetime import datetime
+from docx import Document
+
+def timestamped_outpath(out_path: Path) -> Path:
+    ts = datetime.now().strftime("%m%d%Y_%H%M")
+    stem, suf = out_path.stem, (out_path.suffix or ".csv")
+    return out_path.with_name(f"{stem}__{ts}{suf}")
+
+def _count_tables_recursive(tables, include_nested: bool) -> int:
+    """Count tables; if include_nested, also count tables inside cells recursively."""
+    if not include_nested:
+        return len(tables)
+    total = 0
+    stack = list(tables)
+    while stack:
+        tbl = stack.pop()
+        total += 1
+        for row in tbl.rows:
+            for cell in row.cells:
+                for nt in cell.tables:
+                    stack.append(nt)
+    return total
+
+def count_tables_in_docx(path: Path, include_nested: bool, include_hf: bool):
+    """
+    Return (body_tables, header_tables, footer_tables, total_tables)
+    """
+    doc = Document(path)
+
+    # Body
+    body_tables = _count_tables_recursive(doc.tables, include_nested)
+
+    # Headers/Footers (per section)
+    header_tables = 0
+    footer_tables = 0
+    if include_hf:
+        for section in doc.sections:
+            if section.header:
+                header_tables += _count_tables_recursive(section.header.tables, include_nested)
+            if section.footer:
+                footer_tables += _count_tables_recursive(section.footer.tables, include_nested)
+
+    total_tables = body_tables + header_tables + footer_tables
+    return body_tables, header_tables, footer_tables, total_tables
+
+def main():
+    p = argparse.ArgumentParser(
+        description="Recursively scan .docx files and count tables (body/headers/footers), writing results to CSV."
+    )
+    p.add_argument("--root", type=Path, required=True, help="Root folder to search (recursively).")
+    p.add_argument("--out", type=Path, default=Path("docx_table_counts.csv"),
+                   help="Base output CSV filename (timestamp appended).")
+    p.add_argument("--no-headers-footers", action="store_true",
+                   help="Exclude tables in headers/footers from the counts.")
+    p.add_argument("--no-nested", action="store_true",
+                   help="Do NOT count nested tables inside cells (top-level only).")
+    p.add_argument("--no-timestamp", action="store_true",
+                   help="Do NOT append timestamp to output filename.")
+    args = p.parse_args()
+
+    if not args.root.exists():
+        p.error(f"--root path does not exist: {args.root}")
+
+    include_hf = not args.no_headers_footers
+    include_nested = not args.no_nested
+    out_path = args.out if args.no_timestamp else timestamped_outpath(args.out)
+
+    # [1/5] start + indexing
+    files = list(args.root.rglob("*.docx"))
+    print(f"[1/5] Indexed {len(files)} .docx files under {args.root}")
+
+    headers = ["File Path", "Body Tables", "Header Tables", "Footer Tables", "Total Tables"]
+    results = []
+    total = len(files)
+
+    if total == 0:
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        with out_path.open("w", newline="", encoding="utf-8") as fp:
+            writer = csv.DictWriter(fp, fieldnames=headers)
+            writer.writeheader()
+        print(f"[5/5] Done. Output: {out_path}")
+        return
+
+    # Progress checkpoints: 25%, 50%, 75%
+    checkpoints = {0.25, 0.50, 0.75}
+    fired = set()
+
+    for idx, f in enumerate(files, start=1):
+        try:
+            b, h, ft, t = count_tables_in_docx(f, include_nested=include_nested, include_hf=include_hf)
+            results.append({
+                "File Path": str(f),
+                "Body Tables": b,
+                "Header Tables": h,
+                "Footer Tables": ft,
+                "Total Tables": t
+            })
+        except Exception as e:
+            print(f"[error] {f}: {e}", file=sys.stderr)
+            results.append({
+                "File Path": str(f),
+                "Body Tables": "",
+                "Header Tables": "",
+                "Footer Tables": "",
+                "Total Tables": ""
+            })
+
+        # [2-4/5] milestones
+        progress = idx / total
+        for cp in (0.25, 0.50, 0.75):
+            if progress >= cp and cp not in fired:
+                pct = int(cp * 100)
+                label = 2 if cp == 0.25 else 3 if cp == 0.50 else 4
+                print(f"[{label}/5] ~{pct}% complete ({idx}/{total})")
+                fired.add(cp)
+
+    # Write CSV
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with out_path.open("w", newline="", encoding="utf-8") as fp:
+        writer = csv.DictWriter(fp, fieldnames=headers)
+        writer.writeheader()
+        writer.writerows(results)
+
+    print(f"[5/5] Done. Wrote {len(results)} rows → {out_path}")
+
+if __name__ == "__main__":
+    main()
