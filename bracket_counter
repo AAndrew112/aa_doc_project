@@ -131,8 +131,9 @@ def main():
             non_empty_pairs = pairs - empty_pairs
 
             # Totals: treat highlights as tag-like items
-            total_with_empty = pairs + highlight_count
-            total_no_empty = non_empty_pairs + highlight_count
+            total_with_empty = max(pairs, highlight_count)
+            total_no_empty = max(non_empty_pairs, highlight_count)
+
 
             results.append({
                 "File Path": str(f),
