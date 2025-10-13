@@ -1,16 +1,13 @@
+#!/usr/bin/env python3
 from pathlib import Path
+import argparse
 import csv
+import sys
 from docx import Document
 
-# ==== SETTINGS ====
-ROOT = Path(r"/path/to/your/folder")      # <- change this
-OUT_CSV = Path("docx_bracket_counts.csv") # output path
-# ==================
-
-def extract_text_from_docx(path: Path) -> str:
-    """Extract text from paragraphs, tables, headers, and footers."""
+def extract_text_from_docx(path: Path, include_tables: bool, include_hf: bool) -> str:
+    """Extract text from paragraphs (+ optional tables, headers, footers)."""
     doc = Document(path)
-
     chunks = []
 
     # Body paragraphs
@@ -19,36 +16,41 @@ def extract_text_from_docx(path: Path) -> str:
             chunks.append(p.text)
 
     # Body tables
-    for tbl in doc.tables:
-        for row in tbl.rows:
-            for cell in row.cells:
-                # Avoid duplicates when python-docx shares cell objects
-                chunks.append(cell.text)
+    if include_tables:
+        for tbl in doc.tables:
+            for row in tbl.rows:
+                for cell in row.cells:
+                    # python-docx may reuse cell objects; duplicate text is fine for counting
+                    if cell.text:
+                        chunks.append(cell.text)
 
-    # Headers/footers (per section)
-    for section in doc.sections:
-        if section.header:
-            for p in section.header.paragraphs:
-                if p.text:
-                    chunks.append(p.text)
-            for tbl in section.header.tables:
-                for row in tbl.rows:
-                    for cell in row.cells:
-                        chunks.append(cell.text)
-        if section.footer:
-            for p in section.footer.paragraphs:
-                if p.text:
-                    chunks.append(p.text)
-            for tbl in section.footer.tables:
-                for row in tbl.rows:
-                    for cell in row.cells:
-                        chunks.append(cell.text)
+    # Headers/Footers (per section)
+    if include_hf:
+        for section in doc.sections:
+            if section.header:
+                for p in section.header.paragraphs:
+                    if p.text:
+                        chunks.append(p.text)
+                for tbl in section.header.tables:
+                    for row in tbl.rows:
+                        for cell in row.cells:
+                            if cell.text:
+                                chunks.append(cell.text)
+            if section.footer:
+                for p in section.footer.paragraphs:
+                    if p.text:
+                        chunks.append(p.text)
+                for tbl in section.footer.tables:
+                    for row in tbl.rows:
+                        for cell in row.cells:
+                            if cell.text:
+                                chunks.append(cell.text)
 
     return "\n".join(chunks)
 
 def count_bracket_pairs(text: str):
     """
-    Counts properly matched square-bracket pairs using a simple stack.
+    Count matched square-bracket pairs in sequence order using a simple stack.
     Returns (pairs, opens, closes, unmatched_opens, unmatched_closes).
     """
     opens = text.count("[")
@@ -71,44 +73,99 @@ def count_bracket_pairs(text: str):
     unmatched_opens = stack
     return pairs, opens, closes, unmatched_opens, unmatched_closes
 
-def main():
-    results = []
-    docx_files = list(ROOT.rglob("*.docx"))
-
-    for f in docx_files:
+def scan(root: Path, include_tables: bool, include_hf: bool, verbose: bool):
+    """Yield result dicts for each .docx under root."""
+    for f in root.rglob("*.docx"):
+        if verbose:
+            print(f"Scanning: {f}", file=sys.stderr)
         try:
-            text = extract_text_from_docx(f)
+            text = extract_text_from_docx(f, include_tables=include_tables, include_hf=include_hf)
             pairs, opens, closes, uo, uc = count_bracket_pairs(text)
-            results.append({
+            yield {
                 "file_path": str(f),
                 "pairs": pairs,
                 "opens": opens,
                 "closes": closes,
                 "unmatched_opens": uo,
-                "unmatched_closes": uc
-            })
+                "unmatched_closes": uc,
+                "error": ""
+            }
         except Exception as e:
-            # Still record the file with error info if you want
-            results.append({
+            if verbose:
+                print(f"Error reading {f}: {e}", file=sys.stderr)
+            yield {
                 "file_path": str(f),
                 "pairs": "",
                 "opens": "",
                 "closes": "",
                 "unmatched_opens": "",
                 "unmatched_closes": "",
-            })
-            print(f"Error reading {f}: {e}")
+                "error": str(e)
+            }
+
+def main():
+    p = argparse.ArgumentParser(
+        description="Recursively scan .docx files and count square-bracket pairs, writing results to CSV."
+    )
+    p.add_argument(
+        "--root",
+        type=Path,
+        required=True,
+        help="Root folder to search (recursively)."
+    )
+    p.add_argument(
+        "--out",
+        type=Path,
+        default=Path("docx_bracket_counts.csv"),
+        help="Output CSV file path (default: docx_bracket_counts.csv)"
+    )
+    p.add_argument(
+        "--no-tables",
+        action="store_true",
+        help="Exclude table text from counting."
+    )
+    p.add_argument(
+        "--no-headers-footers",
+        action="store_true",
+        help="Exclude headers/footers from counting."
+    )
+    p.add_argument(
+        "--verbose",
+        "-v",
+        action="store_true",
+        help="Print progress and errors to stderr."
+    )
+
+    args = p.parse_args()
+
+    if not args.root.exists():
+        p.error(f"--root path does not exist: {args.root}")
+
+    include_tables = not args.no_tables
+    include_hf = not args.no_headers_footers
+
+    results = list(scan(args.root, include_tables, include_hf, args.verbose))
 
     # Write CSV
-    OUT_CSV.parent.mkdir(parents=True, exist_ok=True)
-    with OUT_CSV.open("w", newline="", encoding="utf-8") as fp:
-        writer = csv.DictWriter(fp, fieldnames=[
-            "file_path","pairs","opens","closes","unmatched_opens","unmatched_closes"
-        ])
+    args.out.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = [
+        "file_path",
+        "pairs",
+        "opens",
+        "closes",
+        "unmatched_opens",
+        "unmatched_closes",
+        "error"
+    ]
+    with args.out.open("w", newline="", encoding="utf-8") as fp:
+        writer = csv.DictWriter(fp, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(results)
 
-    print(f"Done. Wrote {len(results)} rows to {OUT_CSV}")
+    if args.verbose:
+        ok = sum(1 for r in results if not r["error"])
+        err = len(results) - ok
+        print(f"\nWrote {len(results)} rows to {args.out} (ok={ok}, errors={err})", file=sys.stderr)
 
 if __name__ == "__main__":
     main()
