@@ -6,9 +6,7 @@ import sys
 from datetime import datetime
 from docx import Document
 
-def extract_text_from_docx(path: Path, include_tables: bool, include_hf: bool, echo: bool=False) -> str:
-    """Extract text from paragraphs (+ optional tables, headers, footers)."""
-    if echo: print("      • Reading document body...", file=sys.stderr)
+def extract_text_from_docx(path: Path, include_tables: bool, include_hf: bool) -> str:
     doc = Document(path)
     chunks = []
 
@@ -19,16 +17,14 @@ def extract_text_from_docx(path: Path, include_tables: bool, include_hf: bool, e
 
     # Body tables
     if include_tables:
-        if echo: print("      • Reading tables...", file=sys.stderr)
         for tbl in doc.tables:
             for row in tbl.rows:
                 for cell in row.cells:
                     if cell.text:
                         chunks.append(cell.text)
 
-    # Headers/Footers (per section)
+    # Headers/Footers
     if include_hf:
-        if echo: print("      • Reading headers/footers...", file=sys.stderr)
         for section in doc.sections:
             if section.header:
                 for p in section.header.paragraphs:
@@ -51,18 +47,16 @@ def extract_text_from_docx(path: Path, include_tables: bool, include_hf: bool, e
 
     return "\n".join(chunks)
 
-def any_highlight_in_docx(path: Path, include_tables: bool, include_hf: bool, echo: bool=False) -> bool:
-    """Return True if any run has highlight color set."""
-    if echo: print("      • Checking for highlights...", file=sys.stderr)
+def any_highlight_in_docx(path: Path, include_tables: bool, include_hf: bool) -> bool:
     doc = Document(path)
 
-    def runs_in_paragraphs(paragraphs):
+    def runs_in(paragraphs):
         for p in paragraphs:
             for r in p.runs:
                 yield r
 
     # Body paragraphs
-    for r in runs_in_paragraphs(doc.paragraphs):
+    for r in runs_in(doc.paragraphs):
         if r.font and r.font.highlight_color:
             return True
 
@@ -71,7 +65,7 @@ def any_highlight_in_docx(path: Path, include_tables: bool, include_hf: bool, ec
         for tbl in doc.tables:
             for row in tbl.rows:
                 for cell in row.cells:
-                    for r in runs_in_paragraphs(cell.paragraphs):
+                    for r in runs_in(cell.paragraphs):
                         if r.font and r.font.highlight_color:
                             return True
 
@@ -79,38 +73,31 @@ def any_highlight_in_docx(path: Path, include_tables: bool, include_hf: bool, ec
     if include_hf:
         for section in doc.sections:
             if section.header:
-                for r in runs_in_paragraphs(section.header.paragraphs):
+                for r in runs_in(section.header.paragraphs):
                     if r.font and r.font.highlight_color:
                         return True
                 for tbl in section.header.tables:
                     for row in tbl.rows:
                         for cell in row.cells:
-                            for r in runs_in_paragraphs(cell.paragraphs):
+                            for r in runs_in(cell.paragraphs):
                                 if r.font and r.font.highlight_color:
                                     return True
             if section.footer:
-                for r in runs_in_paragraphs(section.footer.paragraphs):
+                for r in runs_in(section.footer.paragraphs):
                     if r.font and r.font.highlight_color:
                         return True
                 for tbl in section.footer.tables:
                     for row in tbl.rows:
                         for cell in row.cells:
-                            for r in runs_in_paragraphs(cell.paragraphs):
+                            for r in runs_in(cell.paragraphs):
                                 if r.font and r.font.highlight_color:
                                     return True
     return False
 
-def count_pairs_and_empty(text: str, echo: bool=False):
-    """
-    Single-pass bracket matcher using a stack.
-    Counts total matched pairs and how many are 'empty' (only whitespace between [ and ]).
-    Returns (pairs, empty_pairs).
-    """
-    if echo: print("      • Counting bracket pairs...", file=sys.stderr)
-    stack = []  # store indices of '['
+def count_pairs_and_empty(text: str):
+    stack = []
     pairs = 0
     empty_pairs = 0
-
     for i, ch in enumerate(text):
         if ch == "[":
             stack.append(i)
@@ -118,41 +105,26 @@ def count_pairs_and_empty(text: str, echo: bool=False):
             if stack:
                 start = stack.pop()
                 pairs += 1
-                inner = text[start+1:i]
-                if inner.strip() == "":
+                if text[start+1:i].strip() == "":
                     empty_pairs += 1
-            else:
-                # unmatched close; ignore for this report
-                pass
     return pairs, empty_pairs
 
-def scan(root: Path, include_tables: bool, include_hf: bool):
-    """Yield .docx file paths under root."""
-    return list(root.rglob("*.docx"))
-
-def build_timestamped_outpath(out_path: Path) -> Path:
-    """
-    Append __MMDDYYYY_HHMM before the suffix.
-    E.g., myfile.csv -> myfile__10132025_1142.csv
-    """
+def timestamped_outpath(out_path: Path) -> Path:
     ts = datetime.now().strftime("%m%d%Y_%H%M")
-    stem = out_path.stem
-    suffix = out_path.suffix or ".csv"
-    return out_path.with_name(f"{stem}__{ts}{suffix}")
+    stem, suf = out_path.stem, (out_path.suffix or ".csv")
+    return out_path.with_name(f"{stem}__{ts}{suf}")
 
 def main():
     p = argparse.ArgumentParser(
-        description="Recursively scan .docx files, count bracket pairs (and empty pairs), detect highlights, and write CSV."
+        description="Scan .docx recursively; count bracket pairs (and empty pairs); detect highlights; write CSV."
     )
-    p.add_argument("--root", type=Path, required=True, help="Root folder to search (recursively).")
+    p.add_argument("--root", type=Path, required=True, help="Root folder to search.")
     p.add_argument("--out", type=Path, default=Path("docx_bracket_counts.csv"),
-                   help="Base output CSV filename (timestamp will be appended).")
-    p.add_argument("--no-tables", action="store_true", help="Exclude table text from counting.")
-    p.add_argument("--no-headers-footers", action="store_true", help="Exclude headers/footers from counting.")
+                   help="Base output CSV filename (timestamp appended).")
+    p.add_argument("--no-tables", action="store_true", help="Exclude table text.")
+    p.add_argument("--no-headers-footers", action="store_true", help="Exclude headers/footers.")
     p.add_argument("--no-timestamp", action="store_true",
-                   help="Do NOT append timestamp to the output filename (use exactly the provided name).")
-    p.add_argument("-v", "--verbose", action="store_true", help="Print progress to stderr.")
-
+                   help="Do NOT append timestamp to output filename.")
     args = p.parse_args()
 
     if not args.root.exists():
@@ -160,50 +132,44 @@ def main():
 
     include_tables = not args.no_tables
     include_hf = not args.no_headers_footers
+    out_path = args.out if args.no_timestamp else timestamped_outpath(args.out)
 
-    # Decide output path (with timestamp by default)
-    out_path = args.out if args.no_timestamp else build_timestamped_outpath(args.out)
-
-    if args.verbose:
-        print(f"[1/5] Indexing .docx files under: {args.root}", file=sys.stderr)
-    files = scan(args.root, include_tables, include_hf)
-    if args.verbose:
-        print(f"      • Found {len(files)} files\n", file=sys.stderr)
+    # Status 1: start + indexing
+    files = list(args.root.rglob("*.docx"))
+    print(f"[1/5] Indexed {len(files)} .docx files under {args.root}")
 
     results = []
     total = len(files)
-    for i, f in enumerate(files, start=1):
-        if args.verbose:
-            print(f"[2/5] ({i}/{total}) {f}", file=sys.stderr)
+    if total == 0:
+        # Status 5: done (no files)
+        Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+        with open(out_path, "w", newline="", encoding="utf-8") as fp:
+            writer = csv.DictWriter(fp, fieldnames=["file_path", "pairs", "empty_pairs", "has_highlight"])
+            writer.writeheader()
+        print(f"[5/5] Done. Output: {out_path}")
+        return
+
+    # Progress checkpoints: 25%, 50%, 75%
+    checkpoints = {0.25, 0.50, 0.75}
+    fired = set()
+
+    for idx, f in enumerate(files, start=1):
         try:
-            # Extract text
-            text = extract_text_from_docx(f, include_tables=include_tables, include_hf=include_hf, echo=args.verbose)
-
-            # Count pairs
-            pairs, empty_pairs = count_pairs_and_empty(text, echo=args.verbose)
-
-            # Highlight detection
-            has_highlight = ""
+            text = extract_text_from_docx(f, include_tables, include_hf)
+            pairs, empty_pairs = count_pairs_and_empty(text)
             try:
-                has_highlight = any_highlight_in_docx(f, include_tables, include_hf, echo=args.verbose)
+                has_highlight = any_highlight_in_docx(f, include_tables, include_hf)
             except Exception as e:
-                if args.verbose:
-                    print(f"      • Highlight check failed: {e}", file=sys.stderr)
+                print(f"[error] Highlight check failed for {f}: {e}", file=sys.stderr)
                 has_highlight = ""
-
-            # Row
             results.append({
                 "file_path": str(f),
                 "pairs": pairs,
                 "empty_pairs": empty_pairs,
                 "has_highlight": has_highlight
             })
-
-            if args.verbose:
-                print("      • Done.\n", file=sys.stderr)
         except Exception as e:
-            if args.verbose:
-                print(f"      • ERROR reading {f}: {e}\n", file=sys.stderr)
+            print(f"[error] Failed on {f}: {e}", file=sys.stderr)
             results.append({
                 "file_path": str(f),
                 "pairs": "",
@@ -211,24 +177,23 @@ def main():
                 "has_highlight": ""
             })
 
-    # Write CSV
-    if args.verbose:
-        print(f"[3/5] Preparing output folder: {out_path.parent}", file=sys.stderr)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
+        # Status 2–4: 25/50/75% milestones (max three prints)
+        progress = idx / total
+        for cp in sorted(checkpoints):
+            if progress >= cp and cp not in fired:
+                pct = int(cp * 100)
+                print(f"[{2 if cp==0.25 else 3 if cp==0.50 else 4}/5] ~{pct}% complete ({idx}/{total})")
+                fired.add(cp)
 
-    if args.verbose:
-        print(f"[4/5] Writing CSV -> {out_path}", file=sys.stderr)
-    fieldnames = ["file_path", "pairs", "empty_pairs", "has_highlight"]
-    with out_path.open("w", newline="", encoding="utf-8") as fp:
-        writer = csv.DictWriter(fp, fieldnames=fieldnames)
+    # Write CSV
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+    with open(out_path, "w", newline="", encoding="utf-8") as fp:
+        writer = csv.DictWriter(fp, fieldnames=["file_path", "pairs", "empty_pairs", "has_highlight"])
         writer.writeheader()
         writer.writerows(results)
 
-    if args.verbose:
-        ok = sum(1 for r in results if r["pairs"] != "")
-        err = len(results) - ok
-        print(f"[5/5] Done. Rows: {len(results)}  (ok={ok}, errors={err})", file=sys.stderr)
-        print(f"Output: {out_path}", file=sys.stderr)
+    # Status 5: done
+    print(f"[5/5] Done. Wrote {len(results)} rows → {out_path}")
 
 if __name__ == "__main__":
     main()
