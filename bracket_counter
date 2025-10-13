@@ -8,7 +8,7 @@ from docx import Document
 
 def extract_text_and_highlight_count(path: Path, include_tables: bool, include_hf: bool):
     """
-    Open a .docx once and return:
+    Return:
       - text (paragraphs [+ optional tables, headers/footers])
       - highlight_count (number of runs with highlight color set)
     """
@@ -22,7 +22,6 @@ def extract_text_and_highlight_count(path: Path, include_tables: bool, include_h
             if p.text:
                 chunks.append(p.text)
             for r in p.runs:
-                # python-docx uses None for 'no highlight'; any value means highlighted
                 if r.font and r.font.highlight_color:
                     highlight_count += 1
 
@@ -79,7 +78,7 @@ def timestamped_outpath(out_path: Path) -> Path:
 
 def main():
     p = argparse.ArgumentParser(
-        description="Scan .docx recursively; count bracket pairs (and empty pairs); count highlighted runs; write CSV."
+        description="Scan .docx recursively; count bracket pairs (incl. empty); count highlighted runs; write CSV."
     )
     p.add_argument("--root", type=Path, required=True, help="Root folder to search.")
     p.add_argument("--out", type=Path, default=Path("docx_bracket_counts.csv"),
@@ -106,8 +105,17 @@ def main():
 
     if total == 0:
         Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+        headers = [
+            "File Path",
+            "Bracket Pairs",
+            "Empty Pairs",
+            "Non-Empty Pairs",
+            "Highlight Count",
+            "Total Tags (with empty brackets)",
+            "Total Tags (no empty brackets)"
+        ]
         with open(out_path, "w", newline="", encoding="utf-8") as fp:
-            writer = csv.DictWriter(fp, fieldnames=["file_path", "pairs", "empty_pairs", "highlight_count"])
+            writer = csv.DictWriter(fp, fieldnames=headers)
             writer.writeheader()
         print(f"[5/5] Done. Output: {out_path}")
         return
@@ -120,20 +128,31 @@ def main():
         try:
             text, highlight_count = extract_text_and_highlight_count(f, include_tables, include_hf)
             pairs, empty_pairs = count_pairs_and_empty(text)
+            non_empty_pairs = pairs - empty_pairs
+
+            # Totals: treat highlights as tag-like items
+            total_with_empty = pairs + highlight_count
+            total_no_empty = non_empty_pairs + highlight_count
+
             results.append({
-                "file_path": str(f),
-                "pairs": pairs,
-                "empty_pairs": empty_pairs,
-                "highlight_count": highlight_count
+                "File Path": str(f),
+                "Bracket Pairs": pairs,
+                "Empty Pairs": empty_pairs,
+                "Non-Empty Pairs": non_empty_pairs,
+                "Highlight Count": highlight_count,
+                "Total Tags (with empty brackets)": total_with_empty,
+                "Total Tags (no empty brackets)": total_no_empty
             })
         except Exception as e:
-            # Print errors immediately; keep going
             print(f"[error] {f}: {e}", file=sys.stderr)
             results.append({
-                "file_path": str(f),
-                "pairs": "",
-                "empty_pairs": "",
-                "highlight_count": ""
+                "File Path": str(f),
+                "Bracket Pairs": "",
+                "Empty Pairs": "",
+                "Non-Empty Pairs": "",
+                "Highlight Count": "",
+                "Total Tags (with empty brackets)": "",
+                "Total Tags (no empty brackets)": ""
             })
 
         # [2-4/5] at most three progress lines
@@ -147,8 +166,17 @@ def main():
 
     # Write CSV
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+    headers = [
+        "File Path",
+        "Bracket Pairs",
+        "Empty Pairs",
+        "Non-Empty Pairs",
+        "Highlight Count",
+        "Total Tags (with empty brackets)",
+        "Total Tags (no empty brackets)"
+    ]
     with open(out_path, "w", newline="", encoding="utf-8") as fp:
-        writer = csv.DictWriter(fp, fieldnames=["file_path", "pairs", "empty_pairs", "highlight_count"])
+        writer = csv.DictWriter(fp, fieldnames=headers)
         writer.writeheader()
         writer.writerows(results)
 
