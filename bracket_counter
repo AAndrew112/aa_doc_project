@@ -6,95 +6,58 @@ import sys
 from datetime import datetime
 from docx import Document
 
-def extract_text_from_docx(path: Path, include_tables: bool, include_hf: bool) -> str:
+def extract_text_and_highlight_count(path: Path, include_tables: bool, include_hf: bool):
+    """
+    Open a .docx once and return:
+      - text (paragraphs [+ optional tables, headers/footers])
+      - highlight_count (number of runs with highlight color set)
+    """
     doc = Document(path)
     chunks = []
+    highlight_count = 0
 
-    # Body paragraphs
-    for p in doc.paragraphs:
-        if p.text:
-            chunks.append(p.text)
-
-    # Body tables
-    if include_tables:
-        for tbl in doc.tables:
-            for row in tbl.rows:
-                for cell in row.cells:
-                    if cell.text:
-                        chunks.append(cell.text)
-
-    # Headers/Footers
-    if include_hf:
-        for section in doc.sections:
-            if section.header:
-                for p in section.header.paragraphs:
-                    if p.text:
-                        chunks.append(p.text)
-                for tbl in section.header.tables:
-                    for row in tbl.rows:
-                        for cell in row.cells:
-                            if cell.text:
-                                chunks.append(cell.text)
-            if section.footer:
-                for p in section.footer.paragraphs:
-                    if p.text:
-                        chunks.append(p.text)
-                for tbl in section.footer.tables:
-                    for row in tbl.rows:
-                        for cell in row.cells:
-                            if cell.text:
-                                chunks.append(cell.text)
-
-    return "\n".join(chunks)
-
-def any_highlight_in_docx(path: Path, include_tables: bool, include_hf: bool) -> bool:
-    doc = Document(path)
-
-    def runs_in(paragraphs):
+    def add_paragraphs(paragraphs):
+        nonlocal highlight_count
         for p in paragraphs:
+            if p.text:
+                chunks.append(p.text)
             for r in p.runs:
-                yield r
+                # python-docx uses None for 'no highlight'; any value means highlighted
+                if r.font and r.font.highlight_color:
+                    highlight_count += 1
 
     # Body paragraphs
-    for r in runs_in(doc.paragraphs):
-        if r.font and r.font.highlight_color:
-            return True
+    add_paragraphs(doc.paragraphs)
 
     # Body tables
     if include_tables:
         for tbl in doc.tables:
             for row in tbl.rows:
                 for cell in row.cells:
-                    for r in runs_in(cell.paragraphs):
-                        if r.font and r.font.highlight_color:
-                            return True
+                    add_paragraphs(cell.paragraphs)
 
-    # Headers/Footers
+    # Headers/Footers (per section)
     if include_hf:
         for section in doc.sections:
             if section.header:
-                for r in runs_in(section.header.paragraphs):
-                    if r.font and r.font.highlight_color:
-                        return True
+                add_paragraphs(section.header.paragraphs)
                 for tbl in section.header.tables:
                     for row in tbl.rows:
                         for cell in row.cells:
-                            for r in runs_in(cell.paragraphs):
-                                if r.font and r.font.highlight_color:
-                                    return True
+                            add_paragraphs(cell.paragraphs)
             if section.footer:
-                for r in runs_in(section.footer.paragraphs):
-                    if r.font and r.font.highlight_color:
-                        return True
+                add_paragraphs(section.footer.paragraphs)
                 for tbl in section.footer.tables:
                     for row in tbl.rows:
                         for cell in row.cells:
-                            for r in runs_in(cell.paragraphs):
-                                if r.font and r.font.highlight_color:
-                                    return True
-    return False
+                            add_paragraphs(cell.paragraphs)
+
+    return "\n".join(chunks), highlight_count
 
 def count_pairs_and_empty(text: str):
+    """
+    Count total matched [ ... ] pairs and 'empty' pairs (content only whitespace).
+    """
     stack = []
     pairs = 0
     empty_pairs = 0
@@ -116,7 +79,7 @@ def timestamped_outpath(out_path: Path) -> Path:
 
 def main():
     p = argparse.ArgumentParser(
-        description="Scan .docx recursively; count bracket pairs (and empty pairs); detect highlights; write CSV."
+        description="Scan .docx recursively; count bracket pairs (and empty pairs); count highlighted runs; write CSV."
     )
     p.add_argument("--root", type=Path, required=True, help="Root folder to search.")
     p.add_argument("--out", type=Path, default=Path("docx_bracket_counts.csv"),
@@ -134,17 +97,17 @@ def main():
     include_hf = not args.no_headers_footers
     out_path = args.out if args.no_timestamp else timestamped_outpath(args.out)
 
-    # Status 1: start + indexing
+    # [1/5] start + indexing
     files = list(args.root.rglob("*.docx"))
     print(f"[1/5] Indexed {len(files)} .docx files under {args.root}")
 
     results = []
     total = len(files)
+
     if total == 0:
-        # Status 5: done (no files)
         Path(out_path).parent.mkdir(parents=True, exist_ok=True)
         with open(out_path, "w", newline="", encoding="utf-8") as fp:
-            writer = csv.DictWriter(fp, fieldnames=["file_path", "pairs", "empty_pairs", "has_highlight"])
+            writer = csv.DictWriter(fp, fieldnames=["file_path", "pairs", "empty_pairs", "highlight_count"])
             writer.writeheader()
         print(f"[5/5] Done. Output: {out_path}")
         return
@@ -155,44 +118,40 @@ def main():
 
     for idx, f in enumerate(files, start=1):
         try:
-            text = extract_text_from_docx(f, include_tables, include_hf)
+            text, highlight_count = extract_text_and_highlight_count(f, include_tables, include_hf)
             pairs, empty_pairs = count_pairs_and_empty(text)
-            try:
-                has_highlight = any_highlight_in_docx(f, include_tables, include_hf)
-            except Exception as e:
-                print(f"[error] Highlight check failed for {f}: {e}", file=sys.stderr)
-                has_highlight = ""
             results.append({
                 "file_path": str(f),
                 "pairs": pairs,
                 "empty_pairs": empty_pairs,
-                "has_highlight": has_highlight
+                "highlight_count": highlight_count
             })
         except Exception as e:
-            print(f"[error] Failed on {f}: {e}", file=sys.stderr)
+            # Print errors immediately; keep going
+            print(f"[error] {f}: {e}", file=sys.stderr)
             results.append({
                 "file_path": str(f),
                 "pairs": "",
                 "empty_pairs": "",
-                "has_highlight": ""
+                "highlight_count": ""
             })
 
-        # Status 2–4: 25/50/75% milestones (max three prints)
+        # [2-4/5] at most three progress lines
         progress = idx / total
-        for cp in sorted(checkpoints):
+        for cp in (0.25, 0.50, 0.75):
             if progress >= cp and cp not in fired:
                 pct = int(cp * 100)
-                print(f"[{2 if cp==0.25 else 3 if cp==0.50 else 4}/5] ~{pct}% complete ({idx}/{total})")
+                label = 2 if cp == 0.25 else 3 if cp == 0.50 else 4
+                print(f"[{label}/5] ~{pct}% complete ({idx}/{total})")
                 fired.add(cp)
 
     # Write CSV
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, "w", newline="", encoding="utf-8") as fp:
-        writer = csv.DictWriter(fp, fieldnames=["file_path", "pairs", "empty_pairs", "has_highlight"])
+        writer = csv.DictWriter(fp, fieldnames=["file_path", "pairs", "empty_pairs", "highlight_count"])
         writer.writeheader()
         writer.writerows(results)
 
-    # Status 5: done
     print(f"[5/5] Done. Wrote {len(results)} rows → {out_path}")
 
 if __name__ == "__main__":
