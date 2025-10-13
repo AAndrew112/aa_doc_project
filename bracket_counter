@@ -1,0 +1,114 @@
+from pathlib import Path
+import csv
+from docx import Document
+
+# ==== SETTINGS ====
+ROOT = Path(r"/path/to/your/folder")      # <- change this
+OUT_CSV = Path("docx_bracket_counts.csv") # output path
+# ==================
+
+def extract_text_from_docx(path: Path) -> str:
+    """Extract text from paragraphs, tables, headers, and footers."""
+    doc = Document(path)
+
+    chunks = []
+
+    # Body paragraphs
+    for p in doc.paragraphs:
+        if p.text:
+            chunks.append(p.text)
+
+    # Body tables
+    for tbl in doc.tables:
+        for row in tbl.rows:
+            for cell in row.cells:
+                # Avoid duplicates when python-docx shares cell objects
+                chunks.append(cell.text)
+
+    # Headers/footers (per section)
+    for section in doc.sections:
+        if section.header:
+            for p in section.header.paragraphs:
+                if p.text:
+                    chunks.append(p.text)
+            for tbl in section.header.tables:
+                for row in tbl.rows:
+                    for cell in row.cells:
+                        chunks.append(cell.text)
+        if section.footer:
+            for p in section.footer.paragraphs:
+                if p.text:
+                    chunks.append(p.text)
+            for tbl in section.footer.tables:
+                for row in tbl.rows:
+                    for cell in row.cells:
+                        chunks.append(cell.text)
+
+    return "\n".join(chunks)
+
+def count_bracket_pairs(text: str):
+    """
+    Counts properly matched square-bracket pairs using a simple stack.
+    Returns (pairs, opens, closes, unmatched_opens, unmatched_closes).
+    """
+    opens = text.count("[")
+    closes = text.count("]")
+
+    stack = 0
+    pairs = 0
+    unmatched_closes = 0
+
+    for ch in text:
+        if ch == "[":
+            stack += 1
+        elif ch == "]":
+            if stack > 0:
+                stack -= 1
+                pairs += 1
+            else:
+                unmatched_closes += 1
+
+    unmatched_opens = stack
+    return pairs, opens, closes, unmatched_opens, unmatched_closes
+
+def main():
+    results = []
+    docx_files = list(ROOT.rglob("*.docx"))
+
+    for f in docx_files:
+        try:
+            text = extract_text_from_docx(f)
+            pairs, opens, closes, uo, uc = count_bracket_pairs(text)
+            results.append({
+                "file_path": str(f),
+                "pairs": pairs,
+                "opens": opens,
+                "closes": closes,
+                "unmatched_opens": uo,
+                "unmatched_closes": uc
+            })
+        except Exception as e:
+            # Still record the file with error info if you want
+            results.append({
+                "file_path": str(f),
+                "pairs": "",
+                "opens": "",
+                "closes": "",
+                "unmatched_opens": "",
+                "unmatched_closes": "",
+            })
+            print(f"Error reading {f}: {e}")
+
+    # Write CSV
+    OUT_CSV.parent.mkdir(parents=True, exist_ok=True)
+    with OUT_CSV.open("w", newline="", encoding="utf-8") as fp:
+        writer = csv.DictWriter(fp, fieldnames=[
+            "file_path","pairs","opens","closes","unmatched_opens","unmatched_closes"
+        ])
+        writer.writeheader()
+        writer.writerows(results)
+
+    print(f"Done. Wrote {len(results)} rows to {OUT_CSV}")
+
+if __name__ == "__main__":
+    main()
