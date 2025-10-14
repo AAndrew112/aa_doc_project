@@ -5,8 +5,8 @@ from datetime import datetime
 import pdfplumber
 from collections import defaultdict, deque
 
-# ----------------------- Tunable knobs (sane defaults) -----------------------
-SNAP_TOL = 2.0              # pts to snap/cluster parallel lines (coords close -> same line)
+# ----------------------- Defaults (conservative) -----------------------
+SNAP_TOL = 2.0              # pts to snap parallel lines
 MIN_LINE_LEN_FRAC = 0.10    # min line length as fraction of min(page_w, page_h)
 MIN_V_LINES = 3
 MIN_H_LINES = 3
@@ -15,11 +15,11 @@ MIN_AREA_FRAC = 0.015
 MAX_AREA_FRAC = 0.60
 ASPECT_MIN = 0.33
 ASPECT_MAX = 3.0
-HEADER_FOOTER_IGNORE = 0.10  # ignore boxes wholly in top/bottom 10% (letterheads/footers)
-MERGE_VGAP_FRAC = 0.02       # merge vertically stacked boxes with small gap
-MERGE_H_OVERLAP = 0.60       # require >=60% horiz overlap to merge
+HEADER_FOOTER_IGNORE = 0.10   # ignore boxes wholly in top/bottom 10%
+MERGE_VGAP_FRAC = 0.02        # merge vertically stacked boxes with small gap
+MERGE_H_OVERLAP = 0.60        # require >=60% horiz overlap to merge
 
-# ------------------------------- Utilities -----------------------------------
+# ------------------------------- Utils --------------------------------
 def timestamped_outpath(out_path: Path) -> Path:
     ts = datetime.now().strftime("%m%d%Y_%H%M")
     stem, suf = out_path.stem, (out_path.suffix or ".csv")
@@ -37,33 +37,25 @@ def _line_length(ln):
     return abs(ln["x1"] - ln["x0"])
 
 def _cluster_coords(values, tol):
-    """Greedy 1D clustering -> list of cluster centers and mapping idx."""
+    """Greedy 1D clustering -> (centers, idx_map)."""
     if not values:
         return [], {}
     vals = sorted((v, i) for i, v in enumerate(values))
-    clusters = []
-    current = [vals[0][0]]
     centers = []
-    mapping = {}
-    for (v, i) in vals[1:]:
-        if abs(v - current[-1]) <= tol:
-            current.append(v)
+    bucket = [vals[0][0]]
+    for (v, _i) in vals[1:]:
+        if abs(v - bucket[-1]) <= tol:
+            bucket.append(v)
         else:
-            c = sum(current) / len(current)
-            centers.append(c)
-            for k in current:
-                pass
-            current = [v]
-    c = sum(current) / len(current)
-    centers.append(c)
-    # assign
-    ci = 0
-    j = 0
+            centers.append(sum(bucket)/len(bucket))
+            bucket = [v]
+    centers.append(sum(bucket)/len(bucket))
+    # assign each original index to nearest center
+    idx_map = {}
     for (v, i) in vals:
-        while ci < len(centers)-1 and abs(v - centers[ci]) > abs(v - centers[ci+1]):
-            ci += 1
-        mapping[i] = ci
-    return centers, mapping
+        nearest = min(range(len(centers)), key=lambda k: abs(v - centers[k]))
+        idx_map[i] = nearest
+    return centers, idx_map
 
 def _bbox_area_aspect(bbox, pw, ph):
     x0,y0,x1,y1 = bbox
@@ -104,34 +96,67 @@ def _merge_nearby(boxes, pw, ph, vgap_frac=MERGE_VGAP_FRAC, min_h_overlap=MERGE_
         bs = out
     return bs
 
-# ----------------------------- Lattice detector ------------------------------
-def detect_tables_lattice(page):
+# -------------------------- Lattice detector ---------------------------
+def detect_tables_lattice(page, use_aggressive=False):
     """Return list of table bounding boxes using line grids only."""
-    pw, ph = page.width, page.height
-    min_len = min(pw, ph) * MIN_LINE_LEN_FRAC
+    # thresholds (toggle for aggressive recall)
+    snap_tol = SNAP_TOL if not use_aggressive else 3.0
+    min_line_len_frac = MIN_LINE_LEN_FRAC if not use_aggressive else 0.06
+    min_inters = MIN_INTERSECTIONS if not use_aggressive else 4
 
-    # Split & filter lines
+    pw, ph = page.width, page.height
+    min_len = min(pw, ph) * min_line_len_frac
+
     v_lines_raw, h_lines_raw = [], []
+
+    # 1) Native lines
     for ln in getattr(page, "lines", []):
-        if _line_length(ln) < min_len:  # drop tiny lines
+        if _line_length(ln) < min_len:
             continue
         if _is_vertical(ln):
             x = (ln["x0"] + ln["x1"]) / 2.0
             v_lines_raw.append((x, min(ln["top"], ln["bottom"]), max(ln["top"], ln["bottom"])))
-        elif _is_horizontal(ln):
+        else:
             y = (ln["top"] + ln["bottom"]) / 2.0
             h_lines_raw.append((y, min(ln["x0"], ln["x1"]), max(ln["x0"], ln["x1"])))
+
+    # 2) Rectangle edges (aggressive mode)
+    if use_aggressive:
+        for rc in getattr(page, "rects", []):
+            x0, y0, x1, y1 = rc["x0"], rc["y0"], rc["x1"], rc["y1"]
+            w, h = abs(x1 - x0), abs(y1 - y0)
+            if w >= min_len:  # top/bottom
+                y_top = min(y0, y1); y_bot = max(y0, y1)
+                h_lines_raw.append((y_top, min(x0, x1), max(x0, x1)))
+                h_lines_raw.append((y_bot, min(x0, x1), max(x0, x1)))
+            if h >= min_len:  # left/right
+                x_left = min(x0, x1); x_right = max(x0, x1)
+                v_lines_raw.append((x_left, min(y0, y1), max(y0, y1)))
+                v_lines_raw.append((x_right, min(y0, y1), max(y0, y1)))
+
+    # 3) Near-axis curves as lines (aggressive mode)
+    if use_aggressive:
+        for cv in getattr(page, "curves", []):
+            x0, y0, x1, y1 = cv["x0"], cv["y0"], cv["x1"], cv["y1"]
+            dx, dy = abs(x1 - x0), abs(y1 - y0)
+            if max(dx, dy) < min_len:
+                continue
+            if dy <= snap_tol:  # near-horizontal
+                y = (y0 + y1) / 2.0
+                h_lines_raw.append((y, min(x0, x1), max(x0, x1)))
+            elif dx <= snap_tol:  # near-vertical
+                x = (x0 + x1) / 2.0
+                v_lines_raw.append((x, min(y0, y1), max(y0, y1)))
 
     if not v_lines_raw or not h_lines_raw:
         return []
 
     # Snap parallel lines
-    vx_vals = [x for (x,y0,y1) in v_lines_raw]
-    vy_vals = [y for (y,x0,x1) in h_lines_raw]  # for clustering y
-    vx_centers, vx_map_idx = _cluster_coords(vx_vals, SNAP_TOL)
-    vy_centers, vy_map_idx = _cluster_coords(vy_vals, SNAP_TOL)
+    vx_vals = [x for (x,_,_) in v_lines_raw]
+    vy_vals = [y for (y,_,_) in h_lines_raw]
+    vx_centers, vx_map_idx = _cluster_coords(vx_vals, snap_tol)
+    vy_centers, vy_map_idx = _cluster_coords(vy_vals, snap_tol)
 
-    # Build lists by snapped index
     v_by_ix = defaultdict(list)
     for idx,(x,y0,y1) in enumerate(v_lines_raw):
         v_by_ix[vx_map_idx[idx]].append((x,y0,y1))
@@ -154,32 +179,28 @@ def detect_tables_lattice(page):
     if len(v_lines) < MIN_V_LINES or len(h_lines) < MIN_H_LINES:
         return []
 
-    # Intersections: where a vertical spans y and a horizontal spans x
-    # Build bipartite graph between vertical ix and horizontal iy
+    # Intersections -> bipartite graph
     adj = defaultdict(set)
     intersections = set()
+    tol = snap_tol
     for ix, x, vy0, vy1 in v_lines:
         for iy, y, hx0, hx1 in h_lines:
-            if (vy0 - SNAP_TOL) <= y <= (vy1 + SNAP_TOL) and (hx0 - SNAP_TOL) <= x <= (hx1 + SNAP_TOL):
+            if (vy0 - tol) <= y <= (vy1 + tol) and (hx0 - tol) <= x <= (hx1 + tol):
                 adj[("v", ix)].add(("h", iy))
                 adj[("h", iy)].add(("v", ix))
                 intersections.add((ix, iy))
 
-    if len(intersections) < MIN_INTERSECTIONS:
+    if len(intersections) < min_inters:
         return []
 
-    # Connected components over the bipartite graph
-    seen = set()
-    tables = []
+    # Connected components
+    seen = set(); tables = []
     nodes = set(adj.keys())
     for node in list(nodes):
         if node in seen: continue
-        comp = set()
-        q = deque([node])
-        seen.add(node)
+        comp = set(); q = deque([node]); seen.add(node)
         while q:
-            u = q.popleft()
-            comp.add(u)
+            u = q.popleft(); comp.add(u)
             for v in adj[u]:
                 if v not in seen:
                     seen.add(v); q.append(v)
@@ -189,52 +210,43 @@ def detect_tables_lattice(page):
         if len(v_ix) < MIN_V_LINES or len(h_iy) < MIN_H_LINES:
             continue
 
-        # Count intersections inside this component
         comp_inters = [(ix, iy) for (ix, iy) in intersections if ix in v_ix and iy in h_iy]
-        if len(comp_inters) < MIN_INTERSECTIONS:
+        if len(comp_inters) < min_inters:
             continue
 
-        # Bounding box from snapped centers (expand a hair by SNAP_TOL)
         xs = [vx_centers[ix] for ix in v_ix]
         ys = [vy_centers[iy] for iy in h_iy]
-        x0, x1 = min(xs) - SNAP_TOL, max(xs) + SNAP_TOL
-        y0, y1 = min(ys) - SNAP_TOL, max(ys) + SNAP_TOL
+        x0, x1 = min(xs) - tol, max(xs) + tol
+        y0, y1 = min(ys) - tol, max(ys) + tol
         bbox = (max(0, x0), max(0, y0), min(pw, x1), min(ph, y1))
 
-        # Geometry guards
         area_frac, aspect = _bbox_area_aspect(bbox, pw, ph)
         if not (MIN_AREA_FRAC <= area_frac <= MAX_AREA_FRAC and ASPECT_MIN <= aspect <= ASPECT_MAX):
             continue
-
-        # Ignore header/footer artifacts
         if y1 <= ph * HEADER_FOOTER_IGNORE or y0 >= ph * (1.0 - HEADER_FOOTER_IGNORE):
             continue
 
         tables.append(bbox)
 
-    # Merge vertically stacked fragments
-    tables = _merge_nearby(tables, pw, ph, MERGE_VGAP_FRAC, MERGE_H_OVERLAP)
-    return tables
+    return _merge_nearby(tables, pw, ph, MERGE_VGAP_FRAC, MERGE_H_OVERLAP)
 
-# --------------------------------- Runner -----------------------------------
-def process_pdf(path: Path, audit_writer=None):
+# -------------------------------- Runner --------------------------------
+def process_pdf(path: Path, audit_writer=None, aggressive=False):
     pages_n = 0
     img_only = 0
     total_tables = 0
-
     try:
         with pdfplumber.open(path) as pdf:
             pages_n = len(pdf.pages)
             for pi, page in enumerate(pdf.pages, start=1):
                 if len(page.chars) == 0:
                     img_only += 1
-                boxes = detect_tables_lattice(page)
+                boxes = detect_tables_lattice(page, use_aggressive=aggressive)
                 total_tables += len(boxes)
                 if audit_writer is not None:
                     for b in boxes:
                         audit_writer.writerow({
-                            "File Path": str(path),
-                            "Page": pi,
+                            "File Path": str(path), "Page": pi,
                             "x0": round(b[0],2), "y0": round(b[1],2),
                             "x1": round(b[2],2), "y1": round(b[3],2)
                         })
@@ -245,13 +257,15 @@ def process_pdf(path: Path, audit_writer=None):
 
 def main():
     p = argparse.ArgumentParser(
-        description="Count tables in PDFs using a lattice-only (line-grid) detector. No stream detection."
+        description="Count tables in PDFs using a lattice-only (line-grid) detector. No stream."
     )
     p.add_argument("--root", type=Path, required=True, help="Root folder to search (recursively).")
     p.add_argument("--out", type=Path, default=Path("pdf_table_counts_lattice.csv"),
                    help="Base output CSV filename (timestamp appended).")
     p.add_argument("--limit", type=int, default=50, help="Process first N PDFs (default 50).")
     p.add_argument("--audit", type=Path, help="Optional per-table audit CSV (file,page,bbox).")
+    p.add_argument("--aggressive-recall", action="store_true",
+                   help="Broaden detection: include rect/curve edges, looser snapping, shorter lines, fewer intersections.")
     p.add_argument("--no-timestamp", action="store_true", help="Do NOT append timestamp to output filename.")
     args = p.parse_args()
 
@@ -287,7 +301,7 @@ def main():
 
         fired = set()
         for idx, f in enumerate(targets, start=1):
-            pages, img_only, tbls = process_pdf(f, audit_writer=audit_writer)
+            pages, img_only, tbls = process_pdf(f, audit_writer=audit_writer, aggressive=args.aggressive_recall)
             w.writerow({"File Path": str(f), "Pages": pages, "Image-Only Pages": img_only, "Total Tables": tbls})
 
             progress = idx / total
