@@ -1,0 +1,292 @@
+#!/usr/bin/env python3
+from pathlib import Path
+import argparse, csv, sys
+from datetime import datetime
+from zipfile import ZipFile
+import xml.etree.ElementTree as ET
+import pdfplumber
+
+# ---- DOCX (standard library XML) -------------------------------------------
+W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+PARTS_TO_SCAN = {
+    "Body":       "word/document.xml",
+    "Footnotes":  "word/footnotes.xml",
+    "Endnotes":   "word/endnotes.xml",
+    "Comments":   "word/comments.xml",
+}
+
+def _list_header_footer_parts(zf: ZipFile):
+    headers, footers = [], []
+    for name in zf.namelist():
+        if name.startswith("word/header") and name.endswith(".xml"):
+            headers.append(name)
+        elif name.startswith("word/footer") and name.endswith(".xml"):
+            footers.append(name)
+    return headers, footers
+
+def _localname(tag: str) -> str:
+    return tag.split("}", 1)[1] if tag and tag[0] == "{" else tag
+
+def _count_tbls_in_part(zf: ZipFile, part_name: str):
+    """
+    Return (total_tbls, txbx_tbls) for an XML part using stdlib ElementTree.
+    txbx_tbls counts tables inside w:txbxContent (text boxes/shapes).
+    """
+    try:
+        xml = zf.read(part_name)
+    except KeyError:
+        return 0, 0
+    root = ET.fromstring(xml)
+
+    # Build parent map (stdlib ET lacks getparent)
+    parent_map = {child: parent for parent in root.iter() for child in parent}
+
+    total = 0
+    txbx = 0
+    for tbl in root.iter(f"{{{W_NS}}}tbl"):
+        total += 1
+        # Ascend ancestors to see if in w:txbxContent
+        p = parent_map.get(tbl)
+        inside_txbx = False
+        while p is not None:
+            if _localname(p.tag) == "txbxContent" and p.tag.startswith("{"+W_NS+"}"):
+                inside_txbx = True
+                break
+            p = parent_map.get(p)
+        if inside_txbx:
+            txbx += 1
+    return total, txbx
+
+def count_tables_docx_xml(path: Path):
+    """
+    Count all tables across DOCX parts. Returns a dict that matches CSV columns.
+    """
+    counts = {
+        "Body Tables": 0,
+        "Header Tables": 0,
+        "Footer Tables": 0,
+        "Footnote Tables": 0,
+        "Endnote Tables": 0,
+        "Comment Tables": 0,
+        "Tables in Text Boxes/Shapes": 0,
+        "Pages": "",                 # N/A for DOCX
+        "Image-Only Pages": "",      # N/A for DOCX
+        "Lattice Tables": "",        # N/A for DOCX
+        "Stream Tables": "",         # N/A for DOCX
+        "Total Tables": 0
+    }
+    with ZipFile(path) as zf:
+        # Body / notes / comments
+        for label, part in PARTS_TO_SCAN.items():
+            tot, txbx = _count_tbls_in_part(zf, part)
+            if label == "Body":
+                counts["Body Tables"] += tot
+            elif label == "Footnotes":
+                counts["Footnote Tables"] += tot
+            elif label == "Endnotes":
+                counts["Endnote Tables"] += tot
+            elif label == "Comments":
+                counts["Comment Tables"] += tot
+            counts["Tables in Text Boxes/Shapes"] += txbx
+            counts["Total Tables"] += tot
+
+        # Headers / Footers (multiple parts possible)
+        headers, footers = _list_header_footer_parts(zf)
+        for part in headers:
+            tot, txbx = _count_tbls_in_part(zf, part)
+            counts["Header Tables"] += tot
+            counts["Tables in Text Boxes/Shapes"] += txbx
+            counts["Total Tables"] += tot
+        for part in footers:
+            tot, txbx = _count_tbls_in_part(zf, part)
+            counts["Footer Tables"] += tot
+            counts["Tables in Text Boxes/Shapes"] += txbx
+            counts["Total Tables"] += tot
+    return counts
+
+# ---- PDF (pdfplumber) ------------------------------------------------------
+LATTICE_SETTINGS = {
+    "vertical_strategy": "lines",
+    "horizontal_strategy": "lines",
+}
+STREAM_SETTINGS = {
+    "vertical_strategy": "text",
+    "horizontal_strategy": "text",
+    "text_tolerance": 3,
+    "intersection_tolerance": 3,
+    "min_words_vertical": 1,
+    "min_words_horizontal": 1,
+}
+
+def iou(boxA, boxB):
+    xA = max(boxA[0], boxB[0]); yA = max(boxA[1], boxB[1])
+    xB = min(boxA[2], boxB[2]); yB = min(boxA[3], boxB[3])
+    inter_w = max(0, xB - xA); inter_h = max(0, yB - yA)
+    inter = inter_w * inter_h
+    if inter == 0: return 0.0
+    areaA = (boxA[2]-boxA[0])*(boxA[3]-boxA[1])
+    areaB = (boxB[2]-boxB[0])*(boxB[3]-boxB[1])
+    return inter / float(areaA + areaB - inter + 1e-9)
+
+def dedupe_boxes(boxes, iou_thresh=0.6):
+    kept = []
+    for b in boxes:
+        if not any(iou(b, k) >= iou_thresh for k in kept):
+            kept.append(b)
+    return kept
+
+def count_tables_pdf(path: Path, mode: str):
+    """
+    Count tables in a PDF using pdfplumber lattice/stream/both.
+    Returns a dict matching CSV columns.
+    """
+    lattice_sum = 0
+    stream_sum = 0
+    total_sum = 0
+    image_only_pages = 0
+    pages_n = 0
+
+    with pdfplumber.open(path) as pdf:
+        pages_n = len(pdf.pages)
+        for page in pdf.pages:
+            is_image_only = (len(page.chars) == 0)
+            if is_image_only:
+                image_only_pages += 1
+
+            lattice_boxes = []
+            stream_boxes = []
+
+            if mode in ("lattice", "both"):
+                try:
+                    tables = page.find_tables(table_settings=LATTICE_SETTINGS)
+                    lattice_boxes = [t.bbox for t in tables]
+                    lattice_sum += len(lattice_boxes)
+                except Exception:
+                    pass
+            if mode in ("stream", "both"):
+                try:
+                    tables = page.find_tables(table_settings=STREAM_SETTINGS)
+                    stream_boxes = [t.bbox for t in tables]
+                    stream_sum += len(stream_boxes)
+                except Exception:
+                    pass
+
+            if mode == "both":
+                union = dedupe_boxes(lattice_boxes + stream_boxes, iou_thresh=0.6)
+            elif mode == "lattice":
+                union = lattice_boxes
+            else:
+                union = stream_boxes
+            total_sum += len(union)
+
+    return {
+        "Pages": pages_n,
+        "Image-Only Pages": image_only_pages,
+        "Lattice Tables": lattice_sum if mode in ("lattice", "both") else "",
+        "Stream Tables": stream_sum if mode in ("stream", "both") else "",
+        "Body Tables": "",                 # N/A for PDF
+        "Header Tables": "",
+        "Footer Tables": "",
+        "Footnote Tables": "",
+        "Endnote Tables": "",
+        "Comment Tables": "",
+        "Tables in Text Boxes/Shapes": "",
+        "Total Tables": total_sum
+    }
+
+# ---- Shared runner / CLI ---------------------------------------------------
+def timestamped_outpath(out_path: Path) -> Path:
+    ts = datetime.now().strftime("%m%d%Y_%H%M")
+    stem, suf = out_path.stem, (out_path.suffix or ".csv")
+    return out_path.with_name(f"{stem}__{ts}{suf}")
+
+def main():
+    p = argparse.ArgumentParser(
+        description="Count tables in DOCX (XML, stdlib) and PDFs (pdfplumber) in one run; outputs a unified CSV."
+    )
+    p.add_argument("--root", type=Path, required=True, help="Root folder to search (recursively).")
+    p.add_argument("--out", type=Path, default=Path("universal_table_counts.csv"),
+                   help="Base output CSV filename (timestamp appended).")
+    p.add_argument("--pdf-mode", choices=["lattice", "stream", "both"], default="both",
+                   help="PDF detection mode: lines, whitespace, or both (default).")
+    p.add_argument("--no-timestamp", action="store_true",
+                   help="Do NOT append timestamp to output filename.")
+    args = p.parse_args()
+
+    if not args.root.exists():
+        p.error(f"--root path does not exist: {args.root}")
+
+    out_path = args.out if args.no_timestamp else timestamped_outpath(args.out)
+
+    # [1/5] Index files
+    files = list(args.root.rglob("*"))
+    targets = [f for f in files if f.suffix.lower() in (".docx", ".pdf")]
+    print(f"[1/5] Indexed {len(targets)} files (.docx/.pdf) under {args.root}")
+
+    # Unified CSV header (superset)
+    headers = [
+        "File Path",
+        "File Type",
+        "Pages",
+        "Image-Only Pages",
+        "Body Tables",
+        "Header Tables",
+        "Footer Tables",
+        "Footnote Tables",
+        "Endnote Tables",
+        "Comment Tables",
+        "Tables in Text Boxes/Shapes",
+        "Lattice Tables",
+        "Stream Tables",
+        "Total Tables"
+    ]
+
+    rows = []
+    total = len(targets)
+    if total == 0:
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        with out_path.open("w", newline="", encoding="utf-8") as fp:
+            csv.DictWriter(fp, fieldnames=headers).writeheader()
+        print(f"[5/5] Done. Output: {out_path}")
+        return
+
+    checkpoints, fired = (0.25, 0.50, 0.75), set()
+    for idx, f in enumerate(targets, start=1):
+        try:
+            if f.suffix.lower() == ".docx":
+                c = count_tables_docx_xml(f)
+                row = {"File Path": str(f), "File Type": "DOCX"}
+                row.update(c)
+                rows.append(row)
+            elif f.suffix.lower() == ".pdf":
+                c = count_tables_pdf(f, args.pdf_mode)
+                row = {"File Path": str(f), "File Type": "PDF"}
+                row.update(c)
+                rows.append(row)
+        except Exception as e:
+            print(f"[error] {f}: {e}", file=sys.stderr)
+            # Emit a row with blanks where appropriate
+            blank = {h: "" for h in headers}
+            blank["File Path"] = str(f)
+            blank["File Type"] = f.suffix.upper().lstrip(".")
+            rows.append(blank)
+
+        # [2-4/5] progress lines
+        progress = idx / total
+        for cp in checkpoints:
+            if progress >= cp and cp not in fired:
+                pct = int(cp * 100)
+                label = 2 if cp == 0.25 else 3 if cp == 0.50 else 4
+                print(f"[{label}/5] ~{pct}% complete ({idx}/{total})")
+                fired.add(cp)
+
+    # Write CSV
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with out_path.open("w", newline="", encoding="utf-8") as fp:
+        w = csv.DictWriter(fp, fieldnames=headers)
+        w.writeheader(); w.writerows(rows)
+
+    print(f"[5/5] Done. Wrote {len(rows)} rows → {out_path}")
+
+if __name__ == "__main__":
+    main()
