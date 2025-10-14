@@ -1,0 +1,204 @@
+#!/usr/bin/env python3
+from pathlib import Path
+import argparse
+import csv
+import sys
+from datetime import datetime
+from zipfile import ZipFile
+import xml.etree.ElementTree as ET
+
+W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+
+PARTS_TO_SCAN = {
+    "Body":       "word/document.xml",
+    "Footnotes":  "word/footnotes.xml",
+    "Endnotes":   "word/endnotes.xml",
+    "Comments":   "word/comments.xml",
+}
+
+def timestamped_outpath(out_path: Path) -> Path:
+    ts = datetime.now().strftime("%m%d%Y_%H%M")
+    stem, suf = out_path.stem, (out_path.suffix or ".csv")
+    return out_path.with_name(f"{stem}__{ts}{suf}")
+
+def _list_header_footer_parts(zf: ZipFile):
+    headers, footers = [], []
+    for name in zf.namelist():
+        if name.startswith("word/header") and name.endswith(".xml"):
+            headers.append(name)
+        elif name.startswith("word/footer") and name.endswith(".xml"):
+            footers.append(name)
+    return headers, footers
+
+def _localname(tag: str) -> str:
+    # '{namespace}local' -> 'local'
+    if tag[0] == "{":
+        return tag.split("}", 1)[1]
+    return tag
+
+def _count_tbls_in_part(zf: ZipFile, part_name: str):
+    """
+    Return (total_tbls, txbx_tbls) for a given XML part using stdlib ElementTree.
+    txbx_tbls counts tables inside w:txbxContent (text boxes/shapes).
+    """
+    try:
+        xml = zf.read(part_name)
+    except KeyError:
+        return 0, 0  # part not present
+
+    root = ET.fromstring(xml)
+
+    # Build a parent map for ancestor walking (stdlib ET has no getparent())
+    parent_map = {child: parent for parent in root.iter() for child in parent}
+
+    total = 0
+    txbx = 0
+
+    for tbl in root.iter(f"{{{W_NS}}}tbl"):
+        total += 1
+        # Walk ancestors to see if inside w:txbxContent
+        p = parent_map.get(tbl)
+        inside_txbx = False
+        while p is not None:
+            if _localname(p.tag) == "txbxContent" and (p.tag.startswith("{"+W_NS+"}")):
+                inside_txbx = True
+                break
+            p = parent_map.get(p)
+        if inside_txbx:
+            txbx += 1
+
+    return total, txbx
+
+def count_tables_docx_xml(path: Path):
+    """
+    Returns a dict of counts per container + totals:
+      - Body Tables, Header Tables, Footer Tables,
+        Footnote Tables, Endnote Tables, Comment Tables,
+        Tables in Text Boxes/Shapes, Total Tables
+    """
+    counts = {
+        "Body Tables": 0,
+        "Header Tables": 0,
+        "Footer Tables": 0,
+        "Footnote Tables": 0,
+        "Endnote Tables": 0,
+        "Comment Tables": 0,
+        "Tables in Text Boxes/Shapes": 0,
+        "Total Tables": 0,
+    }
+
+    with ZipFile(path) as zf:
+        # Body / notes / comments
+        for label, part in PARTS_TO_SCAN.items():
+            tot, txbx = _count_tbls_in_part(zf, part)
+            if label == "Body":
+                counts["Body Tables"] += tot
+            elif label == "Footnotes":
+                counts["Footnote Tables"] += tot
+            elif label == "Endnotes":
+                counts["Endnote Tables"] += tot
+            elif label == "Comments":
+                counts["Comment Tables"] += tot
+            counts["Tables in Text Boxes/Shapes"] += txbx
+            counts["Total Tables"] += tot
+
+        # Headers / Footers (may be multiple parts)
+        headers, footers = _list_header_footer_parts(zf)
+        for part in headers:
+            tot, txbx = _count_tbls_in_part(zf, part)
+            counts["Header Tables"] += tot
+            counts["Tables in Text Boxes/Shapes"] += txbx
+            counts["Total Tables"] += tot
+
+        for part in footers:
+            tot, txbx = _count_tbls_in_part(zf, part)
+            counts["Footer Tables"] += tot
+            counts["Tables in Text Boxes/Shapes"] += txbx
+            counts["Total Tables"] += tot
+
+    return counts
+
+def main():
+    p = argparse.ArgumentParser(
+        description="Accurate DOCX table counting via standard library XML parsing (counts Body, Headers, Footers, Footnotes, Endnotes, Comments, Text-Box tables)."
+    )
+    p.add_argument("--root", type=Path, required=True, help="Root folder to search (recursively).")
+    p.add_argument("--out", type=Path, default=Path("docx_table_counts_xml.csv"),
+                   help="Base output CSV filename (timestamp appended).")
+    p.add_argument("--no-timestamp", action="store_true",
+                   help="Do NOT append timestamp to output filename.")
+    args = p.parse_args()
+
+    if not args.root.exists():
+        p.error(f"--root path does not exist: {args.root}")
+
+    out_path = args.out if args.no_timestamp else timestamped_outpath(args.out)
+
+    # [1/5] start + indexing
+    files = list(args.root.rglob("*.docx"))
+    print(f"[1/5] Indexed {len(files)} .docx files under {args.root}")
+
+    headers = [
+        "File Path",
+        "Body Tables",
+        "Header Tables",
+        "Footer Tables",
+        "Footnote Tables",
+        "Endnote Tables",
+        "Comment Tables",
+        "Tables in Text Boxes/Shapes",
+        "Total Tables"
+    ]
+
+    rows = []
+    total = len(files)
+    if total == 0:
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        with out_path.open("w", newline="", encoding="utf-8") as fp:
+            writer = csv.DictWriter(fp, fieldnames=headers)
+            writer.writeheader()
+        print(f"[5/5] Done. Output: {out_path}")
+        return
+
+    checkpoints, fired = (0.25, 0.50, 0.75), set()
+
+    for idx, f in enumerate(files, start=1):
+        try:
+            c = count_tables_docx_xml(f)
+            row = {"File Path": str(f)}
+            row.update(c)
+            rows.append(row)
+        except Exception as e:
+            print(f"[error] {f}: {e}", file=sys.stderr)
+            rows.append({
+                "File Path": str(f),
+                "Body Tables": "",
+                "Header Tables": "",
+                "Footer Tables": "",
+                "Footnote Tables": "",
+                "Endnote Tables": "",
+                "Comment Tables": "",
+                "Tables in Text Boxes/Shapes": "",
+                "Total Tables": ""
+            })
+
+        # [2-4/5] milestones
+        progress = idx / total
+        for cp in checkpoints:
+            if progress >= cp and cp not in fired:
+                pct = int(cp * 100)
+                label = 2 if cp == 0.25 else 3 if cp == 0.50 else 4
+                print(f"[{label}/5] ~{pct}% complete ({idx}/{total})")
+                fired.add(cp)
+
+    # Write CSV
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with out_path.open("w", newline="", encoding="utf-8") as fp:
+        writer = csv.DictWriter(fp, fieldnames=headers)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    print(f"[5/5] Done. Wrote {len(rows)} rows → {out_path}")
+
+if __name__ == "__main__":
+    main()
