@@ -6,7 +6,7 @@ from zipfile import ZipFile
 import xml.etree.ElementTree as ET
 import pdfplumber
 
-# ---- DOCX (standard library XML) -------------------------------------------
+# ----------------------- DOCX (standard library XML) ------------------------
 W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 PARTS_TO_SCAN = {
     "Body":       "word/document.xml",
@@ -45,7 +45,6 @@ def _count_tbls_in_part(zf: ZipFile, part_name: str):
     txbx = 0
     for tbl in root.iter(f"{{{W_NS}}}tbl"):
         total += 1
-        # Ascend ancestors to see if in w:txbxContent
         p = parent_map.get(tbl)
         inside_txbx = False
         while p is not None:
@@ -62,6 +61,8 @@ def count_tables_docx_xml(path: Path):
     Count all tables across DOCX parts. Returns a dict that matches CSV columns.
     """
     counts = {
+        "Pages": "",
+        "Image-Only Pages": "",
         "Body Tables": 0,
         "Header Tables": 0,
         "Footer Tables": 0,
@@ -69,10 +70,8 @@ def count_tables_docx_xml(path: Path):
         "Endnote Tables": 0,
         "Comment Tables": 0,
         "Tables in Text Boxes/Shapes": 0,
-        "Pages": "",                 # N/A for DOCX
-        "Image-Only Pages": "",      # N/A for DOCX
-        "Lattice Tables": "",        # N/A for DOCX
-        "Stream Tables": "",         # N/A for DOCX
+        "Lattice Tables": "",
+        "Stream Tables": "",
         "Total Tables": 0
     }
     with ZipFile(path) as zf:
@@ -104,7 +103,8 @@ def count_tables_docx_xml(path: Path):
             counts["Total Tables"] += tot
     return counts
 
-# ---- PDF (pdfplumber) ------------------------------------------------------
+# ---------------------------- PDF (pdfplumber) ------------------------------
+# Stricter stream settings to reduce false positives
 LATTICE_SETTINGS = {
     "vertical_strategy": "lines",
     "horizontal_strategy": "lines",
@@ -112,10 +112,10 @@ LATTICE_SETTINGS = {
 STREAM_SETTINGS = {
     "vertical_strategy": "text",
     "horizontal_strategy": "text",
-    "text_tolerance": 3,
-    "intersection_tolerance": 3,
-    "min_words_vertical": 1,
-    "min_words_horizontal": 1,
+    "text_tolerance": 2,
+    "intersection_tolerance": 2,
+    "min_words_vertical": 3,
+    "min_words_horizontal": 3,
 }
 
 def iou(boxA, boxB):
@@ -135,9 +135,31 @@ def dedupe_boxes(boxes, iou_thresh=0.6):
             kept.append(b)
     return kept
 
+def _filter_big_boxes(boxes, page):
+    # Drop boxes covering most of the page (likely false positives)
+    pw, ph = page.width, page.height
+    page_area = pw * ph
+    keep = []
+    for b in boxes:
+        area = (b[2]-b[0]) * (b[3]-b[1])
+        if page_area <= 0 or area / page_area <= 0.75:
+            keep.append(b)
+    return keep
+
+def _count_rows_cols_from_table(tbl):
+    try:
+        data = tbl.extract()
+        if not data:
+            return 0, 0
+        rows = len(data)
+        cols = max((len(r) for r in data), default=0)
+        return rows, cols
+    except Exception:
+        return 0, 0
+
 def count_tables_pdf(path: Path, mode: str):
     """
-    Count tables in a PDF using pdfplumber lattice/stream/both.
+    Count tables in a PDF using pdfplumber lattice/stream/both with filters.
     Returns a dict matching CSV columns.
     """
     lattice_sum = 0
@@ -159,14 +181,20 @@ def count_tables_pdf(path: Path, mode: str):
             if mode in ("lattice", "both"):
                 try:
                     tables = page.find_tables(table_settings=LATTICE_SETTINGS)
+                    # keep only tables with at least 2x2 cells
+                    tables = [t for t in tables if (lambda rc=_count_rows_cols_from_table(t): rc[0] >= 2 and rc[1] >= 2)()]
                     lattice_boxes = [t.bbox for t in tables]
+                    lattice_boxes = _filter_big_boxes(lattice_boxes, page)
                     lattice_sum += len(lattice_boxes)
                 except Exception:
                     pass
+
             if mode in ("stream", "both"):
                 try:
                     tables = page.find_tables(table_settings=STREAM_SETTINGS)
+                    tables = [t for t in tables if (lambda rc=_count_rows_cols_from_table(t): rc[0] >= 2 and rc[1] >= 2)()]
                     stream_boxes = [t.bbox for t in tables]
+                    stream_boxes = _filter_big_boxes(stream_boxes, page)
                     stream_sum += len(stream_boxes)
                 except Exception:
                     pass
@@ -184,7 +212,7 @@ def count_tables_pdf(path: Path, mode: str):
         "Image-Only Pages": image_only_pages,
         "Lattice Tables": lattice_sum if mode in ("lattice", "both") else "",
         "Stream Tables": stream_sum if mode in ("stream", "both") else "",
-        "Body Tables": "",                 # N/A for PDF
+        "Body Tables": "",
         "Header Tables": "",
         "Footer Tables": "",
         "Footnote Tables": "",
@@ -194,7 +222,7 @@ def count_tables_pdf(path: Path, mode: str):
         "Total Tables": total_sum
     }
 
-# ---- Shared runner / CLI ---------------------------------------------------
+# ----------------------------- Shared runner --------------------------------
 def timestamped_outpath(out_path: Path) -> Path:
     ts = datetime.now().strftime("%m%d%Y_%H%M")
     stem, suf = out_path.stem, (out_path.suffix or ".csv")
@@ -223,7 +251,6 @@ def main():
     targets = [f for f in files if f.suffix.lower() in (".docx", ".pdf")]
     print(f"[1/5] Indexed {len(targets)} files (.docx/.pdf) under {args.root}")
 
-    # Unified CSV header (superset)
     headers = [
         "File Path",
         "File Type",
@@ -265,7 +292,6 @@ def main():
                 rows.append(row)
         except Exception as e:
             print(f"[error] {f}: {e}", file=sys.stderr)
-            # Emit a row with blanks where appropriate
             blank = {h: "" for h in headers}
             blank["File Path"] = str(f)
             blank["File Type"] = f.suffix.upper().lstrip(".")
@@ -273,7 +299,7 @@ def main():
 
         # [2-4/5] progress lines
         progress = idx / total
-        for cp in checkpoints:
+        for cp in (0.25, 0.50, 0.75):
             if progress >= cp and cp not in fired:
                 pct = int(cp * 100)
                 label = 2 if cp == 0.25 else 3 if cp == 0.50 else 4
