@@ -3,301 +3,301 @@ from pathlib import Path
 import argparse, csv, sys
 from datetime import datetime
 import pdfplumber
+from collections import defaultdict, deque
 
-# ---------------------------- PDF (pdfplumber) ------------------------------
-LATTICE_SETTINGS = {"vertical_strategy": "lines", "horizontal_strategy": "lines"}
-STREAM_SETTINGS_BASE = {
-    "vertical_strategy": "text",
-    "horizontal_strategy": "text",
-    "text_tolerance": 0.4,
-    "intersection_tolerance": 0.4,
-    "min_words_vertical": 4,
-    "min_words_horizontal": 4,
-}
-STREAM_SETTINGS_STRICT = {
-    "vertical_strategy": "text",
-    "horizontal_strategy": "text",
-    "text_tolerance": 0.25,
-    "intersection_tolerance": 0.25,
-    "min_words_vertical": 5,
-    "min_words_horizontal": 5,
-}
+# ----------------------- Tunable knobs (sane defaults) -----------------------
+SNAP_TOL = 2.0              # pts to snap/cluster parallel lines (coords close -> same line)
+MIN_LINE_LEN_FRAC = 0.10    # min line length as fraction of min(page_w, page_h)
+MIN_V_LINES = 3
+MIN_H_LINES = 3
+MIN_INTERSECTIONS = 6
+MIN_AREA_FRAC = 0.015
+MAX_AREA_FRAC = 0.60
+ASPECT_MIN = 0.33
+ASPECT_MAX = 3.0
+HEADER_FOOTER_IGNORE = 0.10  # ignore boxes wholly in top/bottom 10% (letterheads/footers)
+MERGE_VGAP_FRAC = 0.02       # merge vertically stacked boxes with small gap
+MERGE_H_OVERLAP = 0.60       # require >=60% horiz overlap to merge
 
-# Base filters (slightly relaxed vs last run)
-BASE_MIN_ROWS = 2
-BASE_MIN_COLS = 2           # was 3
-BASE_MIN_CELL_FILL = 0.45   # was 0.50
-BASE_MIN_PAGE_AREA = 0.01
-BASE_MAX_PAGE_AREA = 0.60
-BASE_ASPECT_MIN = 0.25
-BASE_ASPECT_MAX = 4.00
+# ------------------------------- Utilities -----------------------------------
+def timestamped_outpath(out_path: Path) -> Path:
+    ts = datetime.now().strftime("%m%d%Y_%H%M")
+    stem, suf = out_path.stem, (out_path.suffix or ".csv")
+    return out_path.with_name(f"{stem}__{ts}{suf}")
 
-# Strict pass (still conservative)
-STRICT_MIN_ROWS = 3
-STRICT_MIN_COLS = 3         # was 4
-STRICT_MIN_CELL_FILL = 0.60 # was 0.65
-STRICT_MIN_PAGE_AREA = 0.02
-STRICT_MAX_PAGE_AREA = 0.50
-STRICT_ASPECT_MIN = 0.33
-STRICT_ASPECT_MAX = 3.00
+def _is_vertical(ln):   # ln: dict with x0,x1,top,bottom
+    return abs(ln["x1"] - ln["x0"]) < abs(ln["bottom"] - ln["top"])
 
-def iou(boxA, boxB):
-    xA = max(boxA[0], boxB[0]); yA = max(boxA[1], boxB[1])
-    xB = min(boxA[2], boxB[2]); yB = min(boxA[3], boxB[3])
-    inter_w = max(0, xB - xA); inter_h = max(0, yB - yA)
-    inter = inter_w * inter_h
-    if inter == 0: return 0.0
-    areaA = (boxA[2]-boxA[0])*(boxA[3]-boxA[1])
-    areaB = (boxB[2]-boxB[0])*(boxB[3]-boxB[1])
-    return inter / float(areaA + areaB - inter + 1e-9)
+def _is_horizontal(ln):
+    return abs(ln["x1"] - ln["x0"]) >= abs(ln["bottom"] - ln["top"])
 
-def dedupe_boxes(boxes, iou_thresh=0.6):
-    kept = []
-    for b in boxes:
-        if not any(iou(b, k) >= iou_thresh for k in kept):
-            kept.append(b)
-    return kept
+def _line_length(ln):
+    if _is_vertical(ln):
+        return abs(ln["bottom"] - ln["top"])
+    return abs(ln["x1"] - ln["x0"])
 
-def merge_nearby(boxes, pw, ph, vgap_frac=0.02, min_h_overlap=0.6):
-    """Merge vertically stacked boxes with strong horizontal overlap."""
+def _cluster_coords(values, tol):
+    """Greedy 1D clustering -> list of cluster centers and mapping idx."""
+    if not values:
+        return [], {}
+    vals = sorted((v, i) for i, v in enumerate(values))
+    clusters = []
+    current = [vals[0][0]]
+    centers = []
+    mapping = {}
+    for (v, i) in vals[1:]:
+        if abs(v - current[-1]) <= tol:
+            current.append(v)
+        else:
+            c = sum(current) / len(current)
+            centers.append(c)
+            for k in current:
+                pass
+            current = [v]
+    c = sum(current) / len(current)
+    centers.append(c)
+    # assign
+    ci = 0
+    j = 0
+    for (v, i) in vals:
+        while ci < len(centers)-1 and abs(v - centers[ci]) > abs(v - centers[ci+1]):
+            ci += 1
+        mapping[i] = ci
+    return centers, mapping
+
+def _bbox_area_aspect(bbox, pw, ph):
+    x0,y0,x1,y1 = bbox
+    w = max(0.0, x1 - x0); h = max(0.0, y1 - y0)
+    if pw <= 0 or ph <= 0 or w == 0 or h == 0:
+        return 0.0, 0.0
+    area_frac = (w*h)/(pw*ph)
+    aspect = w/h
+    return area_frac, aspect
+
+def _merge_nearby(boxes, pw, ph, vgap_frac=MERGE_VGAP_FRAC, min_h_overlap=MERGE_H_OVERLAP):
     if not boxes: return boxes
-    changed = True
     vgap = ph * vgap_frac
     def h_overlap(a,b):
         ax0,ax1 = a[0],a[2]; bx0,bx1 = b[0],b[2]
         inter = max(0, min(ax1,bx1) - max(ax0,bx0))
         return inter / max(1e-9, min(ax1-ax0, bx1-bx0))
     bs = sorted(boxes, key=lambda b:(b[1], b[0]))
+    changed = True
     while changed:
         changed = False
         out = []
         i = 0
         while i < len(bs):
-            cur = bs[i]
-            j = i + 1
+            cur = bs[i]; j = i+1
             merged = cur
             while j < len(bs):
                 nxt = bs[j]
-                # vertically adjacent?
                 if 0 <= nxt[1] - merged[3] <= vgap and h_overlap(merged, nxt) >= min_h_overlap:
-                    # merge
                     merged = (min(merged[0], nxt[0]),
                               min(merged[1], nxt[1]),
                               max(merged[2], nxt[2]),
                               max(merged[3], nxt[3]))
-                    j += 1
-                    changed = True
+                    j += 1; changed = True
                 else:
                     break
-            out.append(merged)
-            i = j
+            out.append(merged); i = j
         bs = out
     return bs
 
-def _rows_cols_and_fill(tbl):
-    try:
-        data = tbl.extract()
-        if not data:
-            return 0, 0, 0.0
-        rows = len(data)
-        cols = max((len(r) for r in data), default=0)
-        total = max(rows * cols, 1)
-        non_empty = sum(1 for r in data for c in r if isinstance(c, str) and c.strip())
-        return rows, cols, non_empty / total
-    except Exception:
-        return 0, 0, 0.0
-
-def _reject_by_geometry(box, page, min_area, max_area, aspect_min, aspect_max):
+# ----------------------------- Lattice detector ------------------------------
+def detect_tables_lattice(page):
+    """Return list of table bounding boxes using line grids only."""
     pw, ph = page.width, page.height
-    if pw <= 0 or ph <= 0: return True
-    w = max(0.0, box[2]-box[0]); h = max(0.0, box[3]-box[1])
-    if w == 0 or h == 0: return True
-    area = (w*h)/(pw*ph)
-    if area < min_area or area > max_area: return True
-    aspect = w/h
-    return not (aspect_min <= aspect <= aspect_max)
+    min_len = min(pw, ph) * MIN_LINE_LEN_FRAC
 
-def _filter_tables(page, tables, min_rows, min_cols, min_fill, min_area, max_area, aspect_min, aspect_max):
-    vetted = []
-    for t in tables:
-        r, c, fill = _rows_cols_and_fill(t)
-        if r >= min_rows and c >= min_cols and fill >= min_fill:
-            if not _reject_by_geometry(t.bbox, page, min_area, max_area, aspect_min, aspect_max):
-                vetted.append((t, r, c))
-    return vetted
-
-def _has_rulings(page, bbox, min_lines=2, min_len_frac=0.08):
-    x0,y0,x1,y1 = bbox
-    pw, ph = page.width, page.height
-    min_len = min(pw, ph) * min_len_frac
-    hits = 0
+    # Split & filter lines
+    v_lines_raw, h_lines_raw = [], []
     for ln in getattr(page, "lines", []):
-        lx0, ly0, lx1, ly1 = ln["x0"], ln["top"], ln["x1"], ln["bottom"]
-        if not (x1 < min(lx0,lx1) or x0 > max(lx0,lx1) or y1 < min(ly0,ly1) or y0 > max(ly0,ly1)):
-            if abs(lx1-lx0) >= min_len or abs(ly1-ly0) >= min_len:
-                hits += 1
-                if hits >= min_lines:
-                    return True
-    return False
+        if _line_length(ln) < min_len:  # drop tiny lines
+            continue
+        if _is_vertical(ln):
+            x = (ln["x0"] + ln["x1"]) / 2.0
+            v_lines_raw.append((x, min(ln["top"], ln["bottom"]), max(ln["top"], ln["bottom"])))
+        elif _is_horizontal(ln):
+            y = (ln["top"] + ln["bottom"]) / 2.0
+            h_lines_raw.append((y, min(ln["x0"], ln["x1"]), max(ln["x0"], ln["x1"])))
 
-def _count_tables_pdf_once(path: Path, mode: str, strict: bool):
-    lattice_sum = 0
-    stream_sum = 0
-    total_sum = 0
-    image_only_pages = 0
+    if not v_lines_raw or not h_lines_raw:
+        return []
+
+    # Snap parallel lines
+    vx_vals = [x for (x,y0,y1) in v_lines_raw]
+    vy_vals = [y for (y,x0,x1) in h_lines_raw]  # for clustering y
+    vx_centers, vx_map_idx = _cluster_coords(vx_vals, SNAP_TOL)
+    vy_centers, vy_map_idx = _cluster_coords(vy_vals, SNAP_TOL)
+
+    # Build lists by snapped index
+    v_by_ix = defaultdict(list)
+    for idx,(x,y0,y1) in enumerate(v_lines_raw):
+        v_by_ix[vx_map_idx[idx]].append((x,y0,y1))
+    h_by_iy = defaultdict(list)
+    for idx,(y,x0,x1) in enumerate(h_lines_raw):
+        h_by_iy[vy_map_idx[idx]].append((y,x0,x1))
+
+    # Collapse to maximal extents per snapped line
+    v_lines = []  # (ix, x, y0, y1)
+    for ix, segs in v_by_ix.items():
+        x = vx_centers[ix]
+        y0 = min(s[1] for s in segs); y1 = max(s[2] for s in segs)
+        v_lines.append((ix, x, y0, y1))
+    h_lines = []  # (iy, y, x0, x1)
+    for iy, segs in h_by_iy.items():
+        y = vy_centers[iy]
+        x0 = min(s[1] for s in segs); x1 = max(s[2] for s in segs)
+        h_lines.append((iy, y, x0, x1))
+
+    if len(v_lines) < MIN_V_LINES or len(h_lines) < MIN_H_LINES:
+        return []
+
+    # Intersections: where a vertical spans y and a horizontal spans x
+    # Build bipartite graph between vertical ix and horizontal iy
+    adj = defaultdict(set)
+    intersections = set()
+    for ix, x, vy0, vy1 in v_lines:
+        for iy, y, hx0, hx1 in h_lines:
+            if (vy0 - SNAP_TOL) <= y <= (vy1 + SNAP_TOL) and (hx0 - SNAP_TOL) <= x <= (hx1 + SNAP_TOL):
+                adj[("v", ix)].add(("h", iy))
+                adj[("h", iy)].add(("v", ix))
+                intersections.add((ix, iy))
+
+    if len(intersections) < MIN_INTERSECTIONS:
+        return []
+
+    # Connected components over the bipartite graph
+    seen = set()
+    tables = []
+    nodes = set(adj.keys())
+    for node in list(nodes):
+        if node in seen: continue
+        comp = set()
+        q = deque([node])
+        seen.add(node)
+        while q:
+            u = q.popleft()
+            comp.add(u)
+            for v in adj[u]:
+                if v not in seen:
+                    seen.add(v); q.append(v)
+
+        v_ix = sorted(n[1] for n in comp if n[0] == "v")
+        h_iy = sorted(n[1] for n in comp if n[0] == "h")
+        if len(v_ix) < MIN_V_LINES or len(h_iy) < MIN_H_LINES:
+            continue
+
+        # Count intersections inside this component
+        comp_inters = [(ix, iy) for (ix, iy) in intersections if ix in v_ix and iy in h_iy]
+        if len(comp_inters) < MIN_INTERSECTIONS:
+            continue
+
+        # Bounding box from snapped centers (expand a hair by SNAP_TOL)
+        xs = [vx_centers[ix] for ix in v_ix]
+        ys = [vy_centers[iy] for iy in h_iy]
+        x0, x1 = min(xs) - SNAP_TOL, max(xs) + SNAP_TOL
+        y0, y1 = min(ys) - SNAP_TOL, max(ys) + SNAP_TOL
+        bbox = (max(0, x0), max(0, y0), min(pw, x1), min(ph, y1))
+
+        # Geometry guards
+        area_frac, aspect = _bbox_area_aspect(bbox, pw, ph)
+        if not (MIN_AREA_FRAC <= area_frac <= MAX_AREA_FRAC and ASPECT_MIN <= aspect <= ASPECT_MAX):
+            continue
+
+        # Ignore header/footer artifacts
+        if y1 <= ph * HEADER_FOOTER_IGNORE or y0 >= ph * (1.0 - HEADER_FOOTER_IGNORE):
+            continue
+
+        tables.append(bbox)
+
+    # Merge vertically stacked fragments
+    tables = _merge_nearby(tables, pw, ph, MERGE_VGAP_FRAC, MERGE_H_OVERLAP)
+    return tables
+
+# --------------------------------- Runner -----------------------------------
+def process_pdf(path: Path, audit_writer=None):
     pages_n = 0
+    img_only = 0
+    total_tables = 0
 
-    stream_settings = STREAM_SETTINGS_STRICT if strict else STREAM_SETTINGS_BASE
-    min_rows = STRICT_MIN_ROWS if strict else BASE_MIN_ROWS
-    min_cols = STRICT_MIN_COLS if strict else BASE_MIN_COLS
-    min_fill = STRICT_MIN_CELL_FILL if strict else BASE_MIN_CELL_FILL
-    min_area = STRICT_MIN_PAGE_AREA if strict else BASE_MIN_PAGE_AREA
-    max_area = STRICT_MAX_PAGE_AREA if strict else BASE_MAX_PAGE_AREA
-    aspect_min = STRICT_ASPECT_MIN if strict else BASE_ASPECT_MIN
-    aspect_max = STRICT_ASPECT_MAX if strict else BASE_ASPECT_MAX
-
-    with pdfplumber.open(path) as pdf:
-        pages_n = len(pdf.pages)
-        for page in pdf.pages:
-            if len(page.chars) == 0:
-                image_only_pages += 1
-
-            lattice_boxes = []
-            stream_boxes = []
-
-            if mode in ("lattice", "both"):
-                try:
-                    tables = page.find_tables(table_settings=LATTICE_SETTINGS)
-                    vetted = _filter_tables(page, tables, min_rows, min_cols, min_fill, min_area, max_area, aspect_min, aspect_max)
-                    lattice_boxes = [t.bbox for (t, _, _) in vetted]
-                    lattice_sum += len(lattice_boxes)
-                except Exception:
-                    pass
-
-            if mode in ("stream", "both"):
-                try:
-                    tables = page.find_tables(table_settings=stream_settings)
-                    vetted = _filter_tables(page, tables, min_rows, min_cols, min_fill, min_area, max_area, aspect_min, aspect_max)
-                    # Gate: accept if (has rulings) OR (looks like a true grid ≥3x3)
-                    kept = []
-                    for (t, r, c) in vetted:
-                        if _has_rulings(page, t.bbox) or (r >= 3 and c >= 3):
-                            kept.append(t.bbox)
-                    stream_boxes = kept
-                    stream_sum += len(stream_boxes)
-                except Exception:
-                    pass
-
-            if mode == "both":
-                union = dedupe_boxes(lattice_boxes + stream_boxes, iou_thresh=0.6)
-            elif mode == "lattice":
-                union = lattice_boxes
-            else:
-                union = stream_boxes
-
-            # Merge vertically stacked fragments to reduce 2–3 → 1
-            merged = merge_nearby(union, page.width, page.height, vgap_frac=0.02, min_h_overlap=0.6)
-            total_sum += len(merged)
-
-    return pages_n, image_only_pages, lattice_sum, stream_sum, total_sum
-
-def count_tables_pdf(path: Path, mode: str):
-    pages, img_only, lat_sum, str_sum, total = _count_tables_pdf_once(path, mode, strict=False)
-    conservative = "No"
-    original_total = total
-
-    # Recount when suspiciously high
-    if pages > 0 and (total >= pages):
-        _, _, lat_sum2, str_sum2, total2 = _count_tables_pdf_once(path, mode, strict=True)
-        total, lat_sum, str_sum = total2, lat_sum2, str_sum2
-        conservative = "Yes"
-
-    return {
-        "Pages": pages,
-        "Image-Only Pages": img_only,
-        "Lattice Tables": lat_sum if mode in ("lattice", "both") else "",
-        "Stream Tables": str_sum if mode in ("stream", "both") else "",
-        "Body Tables": "",
-        "Header Tables": "",
-        "Footer Tables": "",
-        "Footnote Tables": "",
-        "Endnote Tables": "",
-        "Comment Tables": "",
-        "Tables in Text Boxes/Shapes": "",
-        "Total Tables": total,
-        "Original Total Tables": original_total,
-        "Conservative Recount Applied": conservative
-    }
-
-# ----------------------------- Runner / CLI ---------------------------------
-def timestamped_outpath(out_path: Path) -> Path:
-    ts = datetime.now().strftime("%m%d%Y_%H%M")
-    stem, suf = out_path.stem, (out_path.suffix or ".csv")
-    return out_path.with_name(f"{stem}__{ts}{suf}")
+    try:
+        with pdfplumber.open(path) as pdf:
+            pages_n = len(pdf.pages)
+            for pi, page in enumerate(pdf.pages, start=1):
+                if len(page.chars) == 0:
+                    img_only += 1
+                boxes = detect_tables_lattice(page)
+                total_tables += len(boxes)
+                if audit_writer is not None:
+                    for b in boxes:
+                        audit_writer.writerow({
+                            "File Path": str(path),
+                            "Page": pi,
+                            "x0": round(b[0],2), "y0": round(b[1],2),
+                            "x1": round(b[2],2), "y1": round(b[3],2)
+                        })
+    except Exception as e:
+        print(f"[error] {path}: {e}", file=sys.stderr)
+        return 0, 0, 0
+    return pages_n, img_only, total_tables
 
 def main():
     p = argparse.ArgumentParser(
-        description="Count tables in PDFs. Stream: rulings OR ≥3x3 grids. Merge adjacent fragments. Strict recount if Total ≥ Pages."
+        description="Count tables in PDFs using a lattice-only (line-grid) detector. No stream detection."
     )
     p.add_argument("--root", type=Path, required=True, help="Root folder to search (recursively).")
-    p.add_argument("--out", type=Path, default=Path("pdf_table_counts.csv"),
+    p.add_argument("--out", type=Path, default=Path("pdf_table_counts_lattice.csv"),
                    help="Base output CSV filename (timestamp appended).")
-    p.add_argument("--pdf-mode", choices=["lattice", "stream", "both"], default="both",
-                   help="PDF detection mode: lattice (lines), stream (text), or both (default).")
-    p.add_argument("--limit", type=int, default=50,
-                   help="Process only the first N PDFs (default 50) for faster testing.")
-    p.add_argument("--no-timestamp", action="store_true",
-                   help="Do NOT append timestamp to output filename.")
+    p.add_argument("--limit", type=int, default=50, help="Process first N PDFs (default 50).")
+    p.add_argument("--audit", type=Path, help="Optional per-table audit CSV (file,page,bbox).")
+    p.add_argument("--no-timestamp", action="store_true", help="Do NOT append timestamp to output filename.")
     args = p.parse_args()
 
     if not args.root.exists():
         p.error(f"--root path does not exist: {args.root}")
 
     out_path = args.out if args.no_timestamp else timestamped_outpath(args.out)
-
     targets = sorted(args.root.rglob("*.pdf"))
     if args.limit and args.limit > 0:
         targets = targets[:args.limit]
 
-    print(f"[1/4] Indexed {len(targets)} PDFs under {args.root}")
+    print(f"[1/3] Indexed {len(targets)} PDFs under {args.root}")
 
-    headers = [
-        "File Path","File Type","Pages","Image-Only Pages",
-        "Body Tables","Header Tables","Footer Tables",
-        "Footnote Tables","Endnote Tables","Comment Tables",
-        "Tables in Text Boxes/Shapes","Lattice Tables","Stream Tables",
-        "Total Tables","Original Total Tables","Conservative Recount Applied"
-    ]
-
+    headers = ["File Path","Pages","Image-Only Pages","Total Tables"]
     out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # optional audit file
+    audit_fp = None; audit_writer = None
+    if args.audit:
+        audit_fp = args.audit.open("w", newline="", encoding="utf-8")
+        audit_writer = csv.DictWriter(audit_fp, fieldnames=["File Path","Page","x0","y0","x1","y1"])
+        audit_writer.writeheader()
+
     with out_path.open("w", newline="", encoding="utf-8") as fp:
         w = csv.DictWriter(fp, fieldnames=headers)
         w.writeheader()
 
         total = len(targets)
         if total == 0:
-            print(f"[4/4] Done. Output: {out_path}")
+            print(f"[3/3] Done. Output: {out_path}")
+            if audit_fp: audit_fp.close()
             return
 
         fired = set()
         for idx, f in enumerate(targets, start=1):
-            try:
-                c = count_tables_pdf(f, args.pdf_mode)
-                row = {"File Path": str(f), "File Type": "PDF"}; row.update(c)
-                w.writerow(row)
-            except Exception as e:
-                print(f"[error] {f}: {e}", file=sys.stderr)
-                blank = {h: "" for h in headers}
-                blank["File Path"] = str(f); blank["File Type"] = "PDF"
-                w.writerow(blank)
+            pages, img_only, tbls = process_pdf(f, audit_writer=audit_writer)
+            w.writerow({"File Path": str(f), "Pages": pages, "Image-Only Pages": img_only, "Total Tables": tbls})
 
             progress = idx / total
             for cp, label in ((0.25,2),(0.50,3),(0.75,4)):
                 if progress >= cp and cp not in fired:
-                    print(f"[{label}/4] ~{int(cp*100)}% complete ({idx}/{total})")
+                    print(f"[{label}/3] ~{int(cp*100)}% complete ({idx}/{total})")
                     fired.add(cp)
 
-    print(f"[4/4] Done. Wrote {len(targets)} rows → {out_path}")
+    if audit_fp: audit_fp.close()
+    print(f"[3/3] Done. Wrote {len(targets)} rows → {out_path}")
 
 if __name__ == "__main__":
     main()
