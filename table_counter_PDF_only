@@ -1,0 +1,259 @@
+#!/usr/bin/env python3
+from pathlib import Path
+import argparse, csv, sys
+from datetime import datetime
+import pdfplumber
+
+# ---------------------------- PDF (pdfplumber) ------------------------------
+# Detection settings (tightened stream thresholds = Option 2)
+LATTICE_SETTINGS = {"vertical_strategy": "lines", "horizontal_strategy": "lines"}
+STREAM_SETTINGS_BASE = {
+    "vertical_strategy": "text",
+    "horizontal_strategy": "text",
+    "text_tolerance": 0.4,           # tightened from 1
+    "intersection_tolerance": 0.4,   # tightened from 1
+    "min_words_vertical": 4,
+    "min_words_horizontal": 4,
+}
+STREAM_SETTINGS_STRICT = {
+    "vertical_strategy": "text",
+    "horizontal_strategy": "text",
+    "text_tolerance": 0.25,          # tightened from 0.5
+    "intersection_tolerance": 0.25,  # tightened from 0.5
+    "min_words_vertical": 5,
+    "min_words_horizontal": 5,
+}
+
+# Base filters (tightened)
+BASE_MIN_ROWS = 2
+BASE_MIN_COLS = 3                  # was 2
+BASE_MIN_CELL_FILL = 0.50          # was 0.30
+BASE_MIN_PAGE_AREA = 0.01
+BASE_MAX_PAGE_AREA = 0.60
+BASE_ASPECT_MIN = 0.25
+BASE_ASPECT_MAX = 4.00
+
+# Stricter second-pass filters (tightened)
+STRICT_MIN_ROWS = 3
+STRICT_MIN_COLS = 4                # was 3
+STRICT_MIN_CELL_FILL = 0.65        # was 0.50
+STRICT_MIN_PAGE_AREA = 0.02
+STRICT_MAX_PAGE_AREA = 0.50
+STRICT_ASPECT_MIN = 0.33
+STRICT_ASPECT_MAX = 3.00
+
+def iou(boxA, boxB):
+    xA = max(boxA[0], boxB[0]); yA = max(boxA[1], boxB[1])
+    xB = min(boxA[2], boxB[2]); yB = min(boxA[3], boxB[3])
+    inter_w = max(0, xB - xA); inter_h = max(0, yB - yA)
+    inter = inter_w * inter_h
+    if inter == 0: return 0.0
+    areaA = (boxA[2]-boxA[0])*(boxA[3]-boxA[1])
+    areaB = (boxB[2]-boxB[0])*(boxB[3]-boxB[1])
+    return inter / float(areaA + areaB - inter + 1e-9)
+
+def dedupe_boxes(boxes, iou_thresh=0.6):
+    kept = []
+    for b in boxes:
+        if not any(iou(b, k) >= iou_thresh for k in kept):
+            kept.append(b)
+    return kept
+
+def _rows_cols_and_fill(tbl):
+    try:
+        data = tbl.extract()
+        if not data:
+            return 0, 0, 0.0
+        rows = len(data)
+        cols = max((len(r) for r in data), default=0)
+        total_cells = max(rows * cols, 1)
+        non_empty = sum(1 for r in data for c in r if isinstance(c, str) and c.strip())
+        fill = non_empty / total_cells
+        return rows, cols, fill
+    except Exception:
+        return 0, 0, 0.0
+
+def _reject_by_geometry(box, page, min_area, max_area, aspect_min, aspect_max):
+    pw, ph = page.width, page.height
+    if pw <= 0 or ph <= 0:
+        return True
+    w = max(0.0, box[2] - box[0]); h = max(0.0, box[3] - box[1])
+    if w == 0 or h == 0:
+        return True
+    area = (w * h) / (pw * ph)
+    if area < min_area or area > max_area:
+        return True
+    aspect = (w / h)
+    if aspect < aspect_min or aspect > aspect_max:
+        return True
+    return False
+
+def _filter_tables(page, tables, min_rows, min_cols, min_fill, min_area, max_area, aspect_min, aspect_max):
+    vetted = []
+    for t in tables:
+        r, c, fill = _rows_cols_and_fill(t)
+        if r >= min_rows and c >= min_cols and fill >= min_fill:
+            if not _reject_by_geometry(t.bbox, page, min_area, max_area, aspect_min, aspect_max):
+                vetted.append(t)
+    return vetted
+
+def _count_tables_pdf_once(path: Path, mode: str, strict: bool):
+    lattice_sum = 0
+    stream_sum = 0
+    total_sum = 0
+    image_only_pages = 0
+    pages_n = 0
+
+    stream_settings = STREAM_SETTINGS_STRICT if strict else STREAM_SETTINGS_BASE
+    min_rows = STRICT_MIN_ROWS if strict else BASE_MIN_ROWS
+    min_cols = STRICT_MIN_COLS if strict else BASE_MIN_COLS
+    min_fill = STRICT_MIN_CELL_FILL if strict else BASE_MIN_CELL_FILL
+    min_area = STRICT_MIN_PAGE_AREA if strict else BASE_MIN_PAGE_AREA
+    max_area = STRICT_MAX_PAGE_AREA if strict else BASE_MAX_PAGE_AREA
+    aspect_min = STRICT_ASPECT_MIN if strict else BASE_ASPECT_MIN
+    aspect_max = STRICT_ASPECT_MAX if strict else BASE_ASPECT_MAX
+
+    with pdfplumber.open(path) as pdf:
+        pages_n = len(pdf.pages)
+        for page in pdf.pages:
+            is_image_only = (len(page.chars) == 0)
+            if is_image_only:
+                image_only_pages += 1
+
+            lattice_boxes = []
+            stream_boxes = []
+
+            if mode in ("lattice", "both"):
+                try:
+                    tables = page.find_tables(table_settings=LATTICE_SETTINGS)
+                    tables = _filter_tables(page, tables, min_rows, min_cols, min_fill, min_area, max_area, aspect_min, aspect_max)
+                    lattice_boxes = [t.bbox for t in tables]
+                    lattice_sum += len(lattice_boxes)
+                except Exception:
+                    pass
+
+            if mode in ("stream", "both"):
+                try:
+                    tables = page.find_tables(table_settings=stream_settings)
+                    tables = _filter_tables(page, tables, min_rows, min_cols, min_fill, min_area, max_area, aspect_min, aspect_max)
+                    stream_boxes = [t.bbox for t in tables]
+                    stream_sum += len(stream_boxes)
+                except Exception:
+                    pass
+
+            if mode == "both":
+                union = dedupe_boxes(lattice_boxes + stream_boxes, iou_thresh=0.6)
+            elif mode == "lattice":
+                union = lattice_boxes
+            else:
+                union = stream_boxes
+            total_sum += len(union)
+
+    return pages_n, image_only_pages, lattice_sum, stream_sum, total_sum
+
+def count_tables_pdf(path: Path, mode: str):
+    """
+    Two-pass PDF counting: base pass, and (if Pages==TotalTables>0) strict pass.
+    Returns dict matching CSV columns, plus 'Original Total Tables' and 'Conservative Recount Applied'.
+    """
+    pages, img_only, lat_sum, str_sum, total = _count_tables_pdf_once(path, mode, strict=False)
+    conservative = "No"
+    original_total = total
+
+    if pages > 0 and total == pages:
+        # Suspect file: re-count with strict rules
+        _, _, lat_sum2, str_sum2, total2 = _count_tables_pdf_once(path, mode, strict=True)
+        total, lat_sum, str_sum = total2, lat_sum2, str_sum2
+        conservative = "Yes"
+
+    return {
+        "Pages": pages,
+        "Image-Only Pages": img_only,
+        "Lattice Tables": lat_sum if mode in ("lattice", "both") else "",
+        "Stream Tables": str_sum if mode in ("stream", "both") else "",
+        "Body Tables": "",
+        "Header Tables": "",
+        "Footer Tables": "",
+        "Footnote Tables": "",
+        "Endnote Tables": "",
+        "Comment Tables": "",
+        "Tables in Text Boxes/Shapes": "",
+        "Total Tables": total,
+        "Original Total Tables": original_total,
+        "Conservative Recount Applied": conservative
+    }
+
+# ----------------------------- Runner / CLI ---------------------------------
+def timestamped_outpath(out_path: Path) -> Path:
+    ts = datetime.now().strftime("%m%d%Y_%H%M")
+    stem, suf = out_path.stem, (out_path.suffix or ".csv")
+    return out_path.with_name(f"{stem}__{ts}{suf}")
+
+def main():
+    p = argparse.ArgumentParser(
+        description="Count tables in PDFs (pdfplumber). Tightened stream thresholds to cut false positives. Recounts strictly if Pages == Total Tables."
+    )
+    p.add_argument("--root", type=Path, required=True, help="Root folder to search (recursively).")
+    p.add_argument("--out", type=Path, default=Path("pdf_table_counts.csv"),
+                   help="Base output CSV filename (timestamp appended).")
+    p.add_argument("--pdf-mode", choices=["lattice", "stream", "both"], default="both",
+                   help="PDF detection mode: lattice (lines), stream (text), or both (default).")
+    p.add_argument("--limit", type=int, default=50,
+                   help="Process only the first N PDFs (default 50) for faster testing.")
+    p.add_argument("--no-timestamp", action="store_true",
+                   help="Do NOT append timestamp to output filename.")
+    args = p.parse_args()
+
+    if not args.root.exists():
+        p.error(f"--root path does not exist: {args.root}")
+
+    out_path = args.out if args.no_timestamp else timestamped_outpath(args.out)
+
+    # Gather PDFs (sorted for determinism), apply limit
+    targets = sorted(args.root.rglob("*.pdf"))
+    if args.limit and args.limit > 0:
+        targets = targets[:args.limit]
+
+    print(f"[1/4] Indexed {len(targets)} PDFs under {args.root}")
+
+    headers = [
+        "File Path","File Type","Pages","Image-Only Pages",
+        "Body Tables","Header Tables","Footer Tables",
+        "Footnote Tables","Endnote Tables","Comment Tables",
+        "Tables in Text Boxes/Shapes","Lattice Tables","Stream Tables",
+        "Total Tables","Original Total Tables","Conservative Recount Applied"
+    ]
+
+    # Stream writes for robustness/speed
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with out_path.open("w", newline="", encoding="utf-8") as fp:
+        w = csv.DictWriter(fp, fieldnames=headers)
+        w.writeheader()
+
+        total = len(targets)
+        if total == 0:
+            print(f"[4/4] Done. Output: {out_path}")
+            return
+
+        fired = set()
+        for idx, f in enumerate(targets, start=1):
+            try:
+                c = count_tables_pdf(f, args.pdf_mode)
+                row = {"File Path": str(f), "File Type": "PDF"}; row.update(c)
+                w.writerow(row)
+            except Exception as e:
+                print(f"[error] {f}: {e}", file=sys.stderr)
+                blank = {h: "" for h in headers}
+                blank["File Path"] = str(f); blank["File Type"] = "PDF"
+                w.writerow(blank)
+
+            progress = idx / total
+            for cp, label in ((0.25,2),(0.50,3),(0.75,4)):
+                if progress >= cp and cp not in fired:
+                    print(f"[{label}/4] ~{int(cp*100)}% complete ({idx}/{total})")
+                    fired.add(cp)
+
+    print(f"[4/4] Done. Wrote {len(targets)} rows → {out_path}")
+
+if __name__ == "__main__":
+    main()
