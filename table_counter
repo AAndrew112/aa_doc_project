@@ -11,54 +11,96 @@ def timestamped_outpath(out_path: Path) -> Path:
     stem, suf = out_path.stem, (out_path.suffix or ".csv")
     return out_path.with_name(f"{stem}__{ts}{suf}")
 
-def _count_tables_recursive(tables, include_nested: bool) -> int:
-    """Count tables; if include_nested, also count tables inside cells recursively."""
-    if not include_nested:
-        return len(tables)
-    total = 0
-    stack = list(tables)
-    while stack:
-        tbl = stack.pop()
-        total += 1
+def _preview_from_table(tbl, max_chars: int = 100) -> str:
+    """Build a short text preview from the first 1–2 rows."""
+    parts = []
+    try:
+        take_rows = min(2, len(tbl.rows))
+        for r in range(take_rows):
+            row_text = " | ".join(c.text.strip() for c in tbl.rows[r].cells)
+            if row_text:
+                parts.append(row_text)
+    except Exception:
+        pass
+    preview = " / ".join(parts).strip()
+    if len(preview) > max_chars:
+        preview = preview[:max_chars - 1] + "…"
+    return preview
+
+def _count_rows_cols(tbl):
+    """Safe row/column counts."""
+    try:
+        rows = len(tbl.rows)
+    except Exception:
+        rows = ""
+    try:
+        cols = len(tbl.columns)
+    except Exception:
+        # Fallback: infer from first row
+        try:
+            cols = len(tbl.rows[0].cells)
+        except Exception:
+            cols = ""
+    return rows, cols
+
+def _walk_tables(tables, location_label: str, results: list, file_path: Path, base_index: int, depth: int = 0):
+    """Record tables and (optionally) nested tables recursively."""
+    idx = base_index
+    for tbl in tables:
+        rows, cols = _count_rows_cols(tbl)
+        preview = _preview_from_table(tbl)
+
+        results.append({
+            "File Path": str(file_path),
+            "Table # (per file)": idx,
+            "Location": location_label,
+            "Nested Depth": depth,
+            "Rows": rows,
+            "Columns": cols,
+            "Preview": preview
+        })
+        idx += 1
+
+        # Walk nested tables inside cells
         for row in tbl.rows:
             for cell in row.cells:
-                for nt in cell.tables:
-                    stack.append(nt)
-    return total
+                if getattr(cell, "tables", None):
+                    idx = _walk_tables(cell.tables, location_label, results, file_path, idx, depth + 1)
+    return idx
 
-def count_tables_in_docx(path: Path, include_nested: bool, include_hf: bool):
+def locate_tables_in_docx(path: Path, include_hf: bool):
     """
-    Return (body_tables, header_tables, footer_tables, total_tables)
+    Return a list of table records for a single docx:
+    - Location: Body / Header (Section N) / Footer (Section N)
+    - Nested Depth: 0 = top-level, >0 = nested inside cells
+    - Rows, Columns, Preview
     """
     doc = Document(path)
+    results = []
+    next_idx = 1
 
-    # Body
-    body_tables = _count_tables_recursive(doc.tables, include_nested)
+    # Body tables
+    next_idx = _walk_tables(doc.tables, "Body", results, path, next_idx, depth=0)
 
-    # Headers/Footers (per section)
-    header_tables = 0
-    footer_tables = 0
+    # Headers/Footers per section
     if include_hf:
-        for section in doc.sections:
+        for s_idx, section in enumerate(doc.sections, start=1):
             if section.header:
-                header_tables += _count_tables_recursive(section.header.tables, include_nested)
+                next_idx = _walk_tables(section.header.tables, f"Header (Section {s_idx})", results, path, next_idx, depth=0)
             if section.footer:
-                footer_tables += _count_tables_recursive(section.footer.tables, include_nested)
+                next_idx = _walk_tables(section.footer.tables, f"Footer (Section {s_idx})", results, path, next_idx, depth=0)
 
-    total_tables = body_tables + header_tables + footer_tables
-    return body_tables, header_tables, footer_tables, total_tables
+    return results
 
 def main():
     p = argparse.ArgumentParser(
-        description="Recursively scan .docx files and count tables (body/headers/footers), writing results to CSV."
+        description="Locate every table in .docx files with location, nested depth, row/col counts, and a text preview."
     )
     p.add_argument("--root", type=Path, required=True, help="Root folder to search (recursively).")
-    p.add_argument("--out", type=Path, default=Path("docx_table_counts.csv"),
+    p.add_argument("--out", type=Path, default=Path("docx_table_locator.csv"),
                    help="Base output CSV filename (timestamp appended).")
     p.add_argument("--no-headers-footers", action="store_true",
-                   help="Exclude tables in headers/footers from the counts.")
-    p.add_argument("--no-nested", action="store_true",
-                   help="Do NOT count nested tables inside cells (top-level only).")
+                   help="Exclude tables in headers/footers.")
     p.add_argument("--no-timestamp", action="store_true",
                    help="Do NOT append timestamp to output filename.")
     args = p.parse_args()
@@ -67,15 +109,14 @@ def main():
         p.error(f"--root path does not exist: {args.root}")
 
     include_hf = not args.no_headers_footers
-    include_nested = not args.no_nested
     out_path = args.out if args.no_timestamp else timestamped_outpath(args.out)
 
     # [1/5] start + indexing
     files = list(args.root.rglob("*.docx"))
     print(f"[1/5] Indexed {len(files)} .docx files under {args.root}")
 
-    headers = ["File Path", "Body Tables", "Header Tables", "Footer Tables", "Total Tables"]
-    results = []
+    headers = ["File Path", "Table # (per file)", "Location", "Nested Depth", "Rows", "Columns", "Preview"]
+    all_rows = []
     total = len(files)
 
     if total == 0:
@@ -92,23 +133,9 @@ def main():
 
     for idx, f in enumerate(files, start=1):
         try:
-            b, h, ft, t = count_tables_in_docx(f, include_nested=include_nested, include_hf=include_hf)
-            results.append({
-                "File Path": str(f),
-                "Body Tables": b,
-                "Header Tables": h,
-                "Footer Tables": ft,
-                "Total Tables": t
-            })
+            all_rows.extend(locate_tables_in_docx(f, include_hf=include_hf))
         except Exception as e:
             print(f"[error] {f}: {e}", file=sys.stderr)
-            results.append({
-                "File Path": str(f),
-                "Body Tables": "",
-                "Header Tables": "",
-                "Footer Tables": "",
-                "Total Tables": ""
-            })
 
         # [2-4/5] milestones
         progress = idx / total
@@ -124,9 +151,9 @@ def main():
     with out_path.open("w", newline="", encoding="utf-8") as fp:
         writer = csv.DictWriter(fp, fieldnames=headers)
         writer.writeheader()
-        writer.writerows(results)
+        writer.writerows(all_rows)
 
-    print(f"[5/5] Done. Wrote {len(results)} rows → {out_path}")
+    print(f"[5/5] Done. Wrote {len(all_rows)} rows → {out_path}")
 
 if __name__ == "__main__":
     main()
