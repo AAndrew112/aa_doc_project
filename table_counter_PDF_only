@@ -5,38 +5,37 @@ from datetime import datetime
 import pdfplumber
 
 # ---------------------------- PDF (pdfplumber) ------------------------------
-# Detection settings (Option 2 kept: tightened stream thresholds)
 LATTICE_SETTINGS = {"vertical_strategy": "lines", "horizontal_strategy": "lines"}
 STREAM_SETTINGS_BASE = {
     "vertical_strategy": "text",
     "horizontal_strategy": "text",
-    "text_tolerance": 0.4,           # tightened from 1
-    "intersection_tolerance": 0.4,   # tightened from 1
+    "text_tolerance": 0.4,
+    "intersection_tolerance": 0.4,
     "min_words_vertical": 4,
     "min_words_horizontal": 4,
 }
 STREAM_SETTINGS_STRICT = {
     "vertical_strategy": "text",
     "horizontal_strategy": "text",
-    "text_tolerance": 0.25,          # tightened from 0.5
-    "intersection_tolerance": 0.25,  # tightened from 0.5
-    "min_words_vertical": 5
+    "text_tolerance": 0.25,
+    "intersection_tolerance": 0.25,
+    "min_words_vertical": 5,
     "min_words_horizontal": 5,
 }
 
-# Base filters (tightened)
+# Base filters (slightly relaxed vs last run)
 BASE_MIN_ROWS = 2
-BASE_MIN_COLS = 3                  # was 2
-BASE_MIN_CELL_FILL = 0.50          # was 0.30
+BASE_MIN_COLS = 2           # was 3
+BASE_MIN_CELL_FILL = 0.45   # was 0.50
 BASE_MIN_PAGE_AREA = 0.01
 BASE_MAX_PAGE_AREA = 0.60
 BASE_ASPECT_MIN = 0.25
 BASE_ASPECT_MAX = 4.00
 
-# Stricter second-pass filters (tightened)
+# Strict pass (still conservative)
 STRICT_MIN_ROWS = 3
-STRICT_MIN_COLS = 4                # was 3
-STRICT_MIN_CELL_FILL = 0.65        # was 0.50
+STRICT_MIN_COLS = 3         # was 4
+STRICT_MIN_CELL_FILL = 0.60 # was 0.65
 STRICT_MIN_PAGE_AREA = 0.02
 STRICT_MAX_PAGE_AREA = 0.50
 STRICT_ASPECT_MIN = 0.33
@@ -59,6 +58,42 @@ def dedupe_boxes(boxes, iou_thresh=0.6):
             kept.append(b)
     return kept
 
+def merge_nearby(boxes, pw, ph, vgap_frac=0.02, min_h_overlap=0.6):
+    """Merge vertically stacked boxes with strong horizontal overlap."""
+    if not boxes: return boxes
+    changed = True
+    vgap = ph * vgap_frac
+    def h_overlap(a,b):
+        ax0,ax1 = a[0],a[2]; bx0,bx1 = b[0],b[2]
+        inter = max(0, min(ax1,bx1) - max(ax0,bx0))
+        return inter / max(1e-9, min(ax1-ax0, bx1-bx0))
+    bs = sorted(boxes, key=lambda b:(b[1], b[0]))
+    while changed:
+        changed = False
+        out = []
+        i = 0
+        while i < len(bs):
+            cur = bs[i]
+            j = i + 1
+            merged = cur
+            while j < len(bs):
+                nxt = bs[j]
+                # vertically adjacent?
+                if 0 <= nxt[1] - merged[3] <= vgap and h_overlap(merged, nxt) >= min_h_overlap:
+                    # merge
+                    merged = (min(merged[0], nxt[0]),
+                              min(merged[1], nxt[1]),
+                              max(merged[2], nxt[2]),
+                              max(merged[3], nxt[3]))
+                    j += 1
+                    changed = True
+                else:
+                    break
+            out.append(merged)
+            i = j
+        bs = out
+    return bs
+
 def _rows_cols_and_fill(tbl):
     try:
         data = tbl.extract()
@@ -66,27 +101,21 @@ def _rows_cols_and_fill(tbl):
             return 0, 0, 0.0
         rows = len(data)
         cols = max((len(r) for r in data), default=0)
-        total_cells = max(rows * cols, 1)
+        total = max(rows * cols, 1)
         non_empty = sum(1 for r in data for c in r if isinstance(c, str) and c.strip())
-        fill = non_empty / total_cells
-        return rows, cols, fill
+        return rows, cols, non_empty / total
     except Exception:
         return 0, 0, 0.0
 
 def _reject_by_geometry(box, page, min_area, max_area, aspect_min, aspect_max):
     pw, ph = page.width, page.height
-    if pw <= 0 or ph <= 0:
-        return True
-    w = max(0.0, box[2] - box[0]); h = max(0.0, box[3] - box[1])
-    if w == 0 or h == 0:
-        return True
-    area = (w * h) / (pw * ph)
-    if area < min_area or area > max_area:
-        return True
-    aspect = (w / h)
-    if aspect < aspect_min or aspect > aspect_max:
-        return True
-    return False
+    if pw <= 0 or ph <= 0: return True
+    w = max(0.0, box[2]-box[0]); h = max(0.0, box[3]-box[1])
+    if w == 0 or h == 0: return True
+    area = (w*h)/(pw*ph)
+    if area < min_area or area > max_area: return True
+    aspect = w/h
+    return not (aspect_min <= aspect <= aspect_max)
 
 def _filter_tables(page, tables, min_rows, min_cols, min_fill, min_area, max_area, aspect_min, aspect_max):
     vetted = []
@@ -94,20 +123,18 @@ def _filter_tables(page, tables, min_rows, min_cols, min_fill, min_area, max_are
         r, c, fill = _rows_cols_and_fill(t)
         if r >= min_rows and c >= min_cols and fill >= min_fill:
             if not _reject_by_geometry(t.bbox, page, min_area, max_area, aspect_min, aspect_max):
-                vetted.append(t)
+                vetted.append((t, r, c))
     return vetted
 
-# ---------- Option 1: require drawn rulings for stream candidates ------------
-def _has_rulings(page, bbox, min_lines=3, min_len_frac=0.12):
-    x0, y0, x1, y1 = bbox
+def _has_rulings(page, bbox, min_lines=2, min_len_frac=0.08):
+    x0,y0,x1,y1 = bbox
     pw, ph = page.width, page.height
     min_len = min(pw, ph) * min_len_frac
     hits = 0
     for ln in getattr(page, "lines", []):
         lx0, ly0, lx1, ly1 = ln["x0"], ln["top"], ln["x1"], ln["bottom"]
-        # bbox intersection test
-        if not (x1 < min(lx0, lx1) or x0 > max(lx0, lx1) or y1 < min(ly0, ly1) or y0 > max(ly0, ly1)):
-            if abs(lx1 - lx0) >= min_len or abs(ly1 - ly0) >= min_len:
+        if not (x1 < min(lx0,lx1) or x0 > max(lx0,lx1) or y1 < min(ly0,ly1) or y0 > max(ly0,ly1)):
+            if abs(lx1-lx0) >= min_len or abs(ly1-ly0) >= min_len:
                 hits += 1
                 if hits >= min_lines:
                     return True
@@ -132,8 +159,7 @@ def _count_tables_pdf_once(path: Path, mode: str, strict: bool):
     with pdfplumber.open(path) as pdf:
         pages_n = len(pdf.pages)
         for page in pdf.pages:
-            is_image_only = (len(page.chars) == 0)
-            if is_image_only:
+            if len(page.chars) == 0:
                 image_only_pages += 1
 
             lattice_boxes = []
@@ -142,8 +168,8 @@ def _count_tables_pdf_once(path: Path, mode: str, strict: bool):
             if mode in ("lattice", "both"):
                 try:
                     tables = page.find_tables(table_settings=LATTICE_SETTINGS)
-                    tables = _filter_tables(page, tables, min_rows, min_cols, min_fill, min_area, max_area, aspect_min, aspect_max)
-                    lattice_boxes = [t.bbox for t in tables]
+                    vetted = _filter_tables(page, tables, min_rows, min_cols, min_fill, min_area, max_area, aspect_min, aspect_max)
+                    lattice_boxes = [t.bbox for (t, _, _) in vetted]
                     lattice_sum += len(lattice_boxes)
                 except Exception:
                     pass
@@ -151,10 +177,13 @@ def _count_tables_pdf_once(path: Path, mode: str, strict: bool):
             if mode in ("stream", "both"):
                 try:
                     tables = page.find_tables(table_settings=stream_settings)
-                    tables = _filter_tables(page, tables, min_rows, min_cols, min_fill, min_area, max_area, aspect_min, aspect_max)
-                    # Option 1 gate: keep only stream boxes that include real drawn lines
-                    tables = [t for t in tables if _has_rulings(page, t.bbox)]
-                    stream_boxes = [t.bbox for t in tables]
+                    vetted = _filter_tables(page, tables, min_rows, min_cols, min_fill, min_area, max_area, aspect_min, aspect_max)
+                    # Gate: accept if (has rulings) OR (looks like a true grid ≥3x3)
+                    kept = []
+                    for (t, r, c) in vetted:
+                        if _has_rulings(page, t.bbox) or (r >= 3 and c >= 3):
+                            kept.append(t.bbox)
+                    stream_boxes = kept
                     stream_sum += len(stream_boxes)
                 except Exception:
                     pass
@@ -165,20 +194,19 @@ def _count_tables_pdf_once(path: Path, mode: str, strict: bool):
                 union = lattice_boxes
             else:
                 union = stream_boxes
-            total_sum += len(union)
+
+            # Merge vertically stacked fragments to reduce 2–3 → 1
+            merged = merge_nearby(union, page.width, page.height, vgap_frac=0.02, min_h_overlap=0.6)
+            total_sum += len(merged)
 
     return pages_n, image_only_pages, lattice_sum, stream_sum, total_sum
 
 def count_tables_pdf(path: Path, mode: str):
-    """
-    Two-pass PDF counting: base pass, then a strict pass when totals are suspicious.
-    Returns dict matching CSV columns, plus 'Original Total Tables' and 'Conservative Recount Applied'.
-    """
     pages, img_only, lat_sum, str_sum, total = _count_tables_pdf_once(path, mode, strict=False)
     conservative = "No"
     original_total = total
 
-    # Option 4: broaden recount trigger
+    # Recount when suspiciously high
     if pages > 0 and (total >= pages):
         _, _, lat_sum2, str_sum2, total2 = _count_tables_pdf_once(path, mode, strict=True)
         total, lat_sum, str_sum = total2, lat_sum2, str_sum2
@@ -209,7 +237,7 @@ def timestamped_outpath(out_path: Path) -> Path:
 
 def main():
     p = argparse.ArgumentParser(
-        description="Count tables in PDFs (pdfplumber). Tight stream thresholds + rulings gate for stream; strict recount if Total >= Pages."
+        description="Count tables in PDFs. Stream: rulings OR ≥3x3 grids. Merge adjacent fragments. Strict recount if Total ≥ Pages."
     )
     p.add_argument("--root", type=Path, required=True, help="Root folder to search (recursively).")
     p.add_argument("--out", type=Path, default=Path("pdf_table_counts.csv"),
@@ -227,7 +255,6 @@ def main():
 
     out_path = args.out if args.no_timestamp else timestamped_outpath(args.out)
 
-    # Gather PDFs (sorted for determinism), apply limit
     targets = sorted(args.root.rglob("*.pdf"))
     if args.limit and args.limit > 0:
         targets = targets[:args.limit]
