@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 from pathlib import Path
 import argparse, csv, sys
-from datetime import datetime
 from zipfile import ZipFile
 import xml.etree.ElementTree as ET
 import pdfplumber
+from collections import defaultdict, deque
 
-# ----------------------- DOCX (standard library XML) ------------------------
+# ========================== DOCX (XML-based) ==========================
 W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 PARTS_TO_SCAN = {
     "Body":       "word/document.xml",
@@ -14,7 +14,6 @@ PARTS_TO_SCAN = {
     "Endnotes":   "word/endnotes.xml",
     "Comments":   "word/comments.xml",
 }
-
 def _list_header_footer_parts(zf: ZipFile):
     headers, footers = [], []
     for name in zf.namelist():
@@ -41,7 +40,8 @@ def _count_tbls_in_part(zf: ZipFile, part_name: str):
         p = parent_map.get(tbl)
         inside_txbx = False
         while p is not None:
-            if _localname(p.tag) == "txbxContent" and p.tag.startswith("{"+W_NS+"}"):
+            # broaden: count any txbxContent regardless of prefix ns
+            if _localname(p.tag) == "txbxContent":
                 inside_txbx = True
                 break
             p = parent_map.get(p)
@@ -49,57 +49,284 @@ def _count_tbls_in_part(zf: ZipFile, part_name: str):
             txbx += 1
     return total, txbx
 
-def count_tables_docx_xml(path: Path):
-    counts = {
-        "Pages": "",
-        "Image-Only Pages": "",
-        "Body Tables": 0,
-        "Header Tables": 0,
-        "Footer Tables": 0,
-        "Footnote Tables": 0,
-        "Endnote Tables": 0,
-        "Comment Tables": 0,
-        "Tables in Text Boxes/Shapes": 0,
-        "Lattice Tables": "",
-        "Stream Tables": "",
-        "Total Tables": 0,
-        "Original Total Tables": "",
-        "Conservative Recount Applied": "No"
-    }
+def count_tables_docx_xml(path: Path) -> int:
+    total_tables = 0
     with ZipFile(path) as zf:
-        for label, part in PARTS_TO_SCAN.items():
-            tot, txbx = _count_tbls_in_part(zf, part)
-            if label == "Body":
-                counts["Body Tables"] += tot
-            elif label == "Footnotes":
-                counts["Footnote Tables"] += tot
-            elif label == "Endnotes":
-                counts["Endnote Tables"] += tot
-            elif label == "Comments":
-                counts["Comment Tables"] += tot
-            counts["Tables in Text Boxes/Shapes"] += txbx
-            counts["Total Tables"] += tot
+        for _, part in PARTS_TO_SCAN.items():
+            tot, _ = _count_tbls_in_part(zf, part)
+            total_tables += tot
         headers, footers = _list_header_footer_parts(zf)
         for part in headers:
-            tot, txbx = _count_tbls_in_part(zf, part)
-            counts["Header Tables"] += tot
-            counts["Tables in Text Boxes/Shapes"] += txbx
-            counts["Total Tables"] += tot
+            tot, _ = _count_tbls_in_part(zf, part); total_tables += tot
         for part in footers:
-            tot, txbx = _count_tbls_in_part(zf, part)
-            counts["Footer Tables"] += tot
-            counts["Tables in Text Boxes/Shapes"] += txbx
-            counts["Total Tables"] += tot
-    return counts
+            tot, _ = _count_tbls_in_part(zf, part); total_tables += tot
+    return total_tables
 
-# ---------------------------- PDF (pdfplumber) ------------------------------
-LATTICE_SETTINGS = {"vertical_strategy": "lines", "horizontal_strategy": "lines"}
-STREAM_SETTINGS_BASE = {
-    "vertical_strategy": "text",
-    "horizontal_strategy": "text",
-    "text_tolerance": 0.4,           # tightened from 1
-    "intersection_tolerance": 0.4,   # tightened from 1
-    "min_words_vertical": 4,
-    "min_words_horizontal": 4,
-}
-STREAM_SETTI_
+# ========================== PDF (lattice-only, aggressive recall) ==========================
+# Defaults tuned for higher recall without reintroducing stream FPs
+SNAP_TOL = 3.0              # pts to snap/cluster parallel lines
+MIN_LINE_LEN_FRAC = 0.06    # min line length as fraction of min(page_w, page_h)
+MIN_V_LINES = 3
+MIN_H_LINES = 3
+MIN_INTERSECTIONS = 4
+MIN_AREA_FRAC = 0.015
+MAX_AREA_FRAC = 0.60
+ASPECT_MIN = 0.33
+ASPECT_MAX = 3.0
+HEADER_FOOTER_IGNORE = 0.10
+MERGE_VGAP_FRAC = 0.02
+MERGE_H_OVERLAP = 0.60
+
+def _is_vertical(ln):   # ln: dict with x0,x1,top,bottom
+    return abs(ln["x1"] - ln["x0"]) < abs(ln["bottom"] - ln["top"])
+
+def _is_horizontal(ln):
+    return abs(ln["x1"] - ln["x0"]) >= abs(ln["bottom"] - ln["top"])
+
+def _line_length(ln):
+    if _is_vertical(ln):
+        return abs(ln["bottom"] - ln["top"])
+    return abs(ln["x1"] - ln["x0"])
+
+def _cluster_coords(values, tol):
+    if not values:
+        return [], {}
+    vals = sorted((v, i) for i, v in enumerate(values))
+    centers = []
+    bucket = [vals[0][0]]
+    for (v, _i) in vals[1:]:
+        if abs(v - bucket[-1]) <= tol:
+            bucket.append(v)
+        else:
+            centers.append(sum(bucket)/len(bucket))
+            bucket = [v]
+    centers.append(sum(bucket)/len(bucket))
+    idx_map = {}
+    for (v, i) in vals:
+        nearest = min(range(len(centers)), key=lambda k: abs(v - centers[k]))
+        idx_map[i] = nearest
+    return centers, idx_map
+
+def _bbox_area_aspect(bbox, pw, ph):
+    x0,y0,x1,y1 = bbox
+    w = max(0.0, x1 - x0); h = max(0.0, y1 - y0)
+    if pw <= 0 or ph <= 0 or w == 0 or h == 0:
+        return 0.0, 0.0
+    area_frac = (w*h)/(pw*ph)
+    aspect = w/h
+    return area_frac, aspect
+
+def _merge_nearby(boxes, pw, ph, vgap_frac=MERGE_VGAP_FRAC, min_h_overlap=MERGE_H_OVERLAP):
+    if not boxes: return boxes
+    vgap = ph * vgap_frac
+    def h_overlap(a,b):
+        ax0,ax1 = a[0],a[2]; bx0,bx1 = b[0],b[2]
+        inter = max(0, min(ax1,bx1) - max(ax0,bx0))
+        return inter / max(1e-9, min(ax1-ax0, bx1-bx0))
+    bs = sorted(boxes, key=lambda b:(b[1], b[0]))
+    changed = True
+    while changed:
+        changed = False
+        out = []
+        i = 0
+        while i < len(bs):
+            cur = bs[i]; j = i+1
+            merged = cur
+            while j < len(bs):
+                nxt = bs[j]
+                if 0 <= nxt[1] - merged[3] <= vgap and h_overlap(merged, nxt) >= min_h_overlap:
+                    merged = (min(merged[0], nxt[0]),
+                              min(merged[1], nxt[1]),
+                              max(merged[2], nxt[2]),
+                              max(merged[3], nxt[3]))
+                    j += 1; changed = True
+                else:
+                    break
+            out.append(merged); i = j
+        bs = out
+    return bs
+
+def detect_tables_lattice(page):
+    """Return list of table bounding boxes using drawn line grids + rect/curve edges."""
+    pw, ph = page.width, page.height
+    min_len = min(pw, ph) * MIN_LINE_LEN_FRAC
+
+    v_lines_raw, h_lines_raw = [], []
+
+    # 1) Native lines
+    for ln in getattr(page, "lines", []):
+        if _line_length(ln) < min_len:
+            continue
+        if _is_vertical(ln):
+            x = (ln["x0"] + ln["x1"]) / 2.0
+            v_lines_raw.append((x, min(ln["top"], ln["bottom"]), max(ln["top"], ln["bottom"])))
+        else:
+            y = (ln["top"] + ln["bottom"]) / 2.0
+            h_lines_raw.append((y, min(ln["x0"], ln["x1"]), max(ln["x0"], ln["x1"])))
+
+    # 2) Rectangle edges as lines
+    for rc in getattr(page, "rects", []):
+        x0, y0, x1, y1 = rc["x0"], rc["y0"], rc["x1"], rc["y1"]
+        w, h = abs(x1 - x0), abs(y1 - y0)
+        if w >= min_len:  # top/bottom edges -> horizontals
+            y_top = min(y0, y1); y_bot = max(y0, y1)
+            h_lines_raw.append((y_top, min(x0, x1), max(x0, x1)))
+            h_lines_raw.append((y_bot, min(x0, x1), max(x0, x1)))
+        if h >= min_len:  # left/right edges -> verticals
+            x_left = min(x0, x1); x_right = max(x0, x1)
+            v_lines_raw.append((x_left, min(y0, y1), max(y0, y1)))
+            v_lines_raw.append((x_right, min(y0, y1), max(y0, y1)))
+
+    # 3) Near-axis curves as lines (hairline tables sometimes stored as curves)
+    for cv in getattr(page, "curves", []):
+        x0, y0, x1, y1 = cv["x0"], cv["y0"], cv["x1"], cv["y1"]
+        dx, dy = abs(x1 - x0), abs(y1 - y0)
+        if max(dx, dy) < min_len:
+            continue
+        if dy <= SNAP_TOL:  # near-horizontal
+            y = (y0 + y1) / 2.0
+            h_lines_raw.append((y, min(x0, x1), max(x0, x1)))
+        elif dx <= SNAP_TOL:  # near-vertical
+            x = (x0 + x1) / 2.0
+            v_lines_raw.append((x, min(y0, y1), max(y0, y1)))
+
+    if not v_lines_raw or not h_lines_raw:
+        return []
+
+    # Snap parallel lines
+    vx_vals = [x for (x,_,_) in v_lines_raw]
+    vy_vals = [y for (y,_,_) in h_lines_raw]
+    vx_centers, vx_map_idx = _cluster_coords(vx_vals, SNAP_TOL)
+    vy_centers, vy_map_idx = _cluster_coords(vy_vals, SNAP_TOL)
+
+    v_by_ix = defaultdict(list)
+    for idx,(x,y0,y1) in enumerate(v_lines_raw):
+        v_by_ix[vx_map_idx[idx]].append((x,y0,y1))
+    h_by_iy = defaultdict(list)
+    for idx,(y,x0,x1) in enumerate(h_lines_raw):
+        h_by_iy[vy_map_idx[idx]].append((y,x0,x1))
+
+    # Collapse to maximal extents per snapped line
+    v_lines = []  # (ix, x, y0, y1)
+    for ix, segs in v_by_ix.items():
+        x = vx_centers[ix]
+        y0 = min(s[1] for s in segs); y1 = max(s[2] for s in segs)
+        v_lines.append((ix, x, y0, y1))
+    h_lines = []  # (iy, y, x0, x1)
+    for iy, segs in h_by_iy.items():
+        y = vy_centers[iy]
+        x0 = min(s[1] for s in segs); x1 = max(s[2] for s in segs)
+        h_lines.append((iy, y, x0, x1))
+
+    if len(v_lines) < MIN_V_LINES or len(h_lines) < MIN_H_LINES:
+        return []
+
+    # Intersections -> bipartite graph
+    adj = defaultdict(set)
+    intersections = set()
+    tol = SNAP_TOL
+    for ix, x, vy0, vy1 in v_lines:
+        for iy, y, hx0, hx1 in h_lines:
+            if (vy0 - tol) <= y <= (vy1 + tol) and (hx0 - tol) <= x <= (hx1 + tol):
+                adj[("v", ix)].add(("h", iy))
+                adj[("h", iy)].add(("v", ix))
+                intersections.add((ix, iy))
+
+    if len(intersections) < MIN_INTERSECTIONS:
+        return []
+
+    # Connected components
+    seen = set(); tables = []
+    nodes = set(adj.keys())
+    for node in list(nodes):
+        if node in seen: continue
+        comp = set(); q = deque([node]); seen.add(node)
+        while q:
+            u = q.popleft(); comp.add(u)
+            for v in adj[u]:
+                if v not in seen:
+                    seen.add(v); q.append(v)
+
+        v_ix = sorted(n[1] for n in comp if n[0] == "v")
+        h_iy = sorted(n[1] for n in comp if n[0] == "h")
+        if len(v_ix) < MIN_V_LINES or len(h_iy) < MIN_H_LINES:
+            continue
+
+        comp_inters = [(ix, iy) for (ix, iy) in intersections if ix in v_ix and iy in h_iy]
+        if len(comp_inters) < MIN_INTERSECTIONS:
+            continue
+
+        xs = [vx_centers[ix] for ix in v_ix]
+        ys = [vy_centers[iy] for iy in h_iy]
+        x0, x1 = min(xs) - tol, max(xs) + tol
+        y0, y1 = min(ys) - tol, max(ys) + tol
+        bbox = (max(0, x0), max(0, y0), min(pw, x1), min(ph, y1))
+
+        area_frac, aspect = _bbox_area_aspect(bbox, pw, ph)
+        if not (MIN_AREA_FRAC <= area_frac <= MAX_AREA_FRAC and ASPECT_MIN <= aspect <= ASPECT_MAX):
+            continue
+        if y1 <= ph * HEADER_FOOTER_IGNORE or y0 >= ph * (1.0 - HEADER_FOOTER_IGNORE):
+            continue
+
+        tables.append(bbox)
+
+    return _merge_nearby(tables, pw, ph, MERGE_VGAP_FRAC, MERGE_H_OVERLAP)
+
+def count_tables_pdf(path: Path) -> int:
+    total = 0
+    with pdfplumber.open(path) as pdf:
+        for page in pdf.pages:
+            boxes = detect_tables_lattice(page)
+            total += len(boxes)
+    return total
+
+# ================================ Runner =================================
+def main():
+    p = argparse.ArgumentParser(
+        description="Count tables in DOCX (XML scan) and PDF (lattice-only, aggressive recall). Outputs CSV with File Path, File Type, Total Tables."
+    )
+    p.add_argument("--root", type=Path, required=True, help="Root folder to search (recursively).")
+    p.add_argument("--out", type=Path, default=Path("universal_table_counts.csv"),
+                   help="Output CSV filename.")
+    args = p.parse_args()
+
+    if not args.root.exists():
+        p.error(f"--root path does not exist: {args.root}")
+
+    # Collect all targets (no limit)
+    targets = [p for p in args.root.rglob("*") if p.suffix.lower() in (".pdf", ".docx")]
+    targets.sort()
+
+    headers = ["File Path", "File Type", "Total Tables"]
+    args.out.parent.mkdir(parents=True, exist_ok=True)
+
+    with args.out.open("w", newline="", encoding="utf-8") as fp:
+        w = csv.DictWriter(fp, fieldnames=headers)
+        w.writeheader()
+
+        total = len(targets)
+        if total == 0:
+            print(f"[done] No .pdf/.docx files under {args.root}")
+            return
+
+        for idx, f in enumerate(targets, start=1):
+            try:
+                if f.suffix.lower() == ".pdf":
+                    n = count_tables_pdf(f)
+                    w.writerow({"File Path": str(f), "File Type": "PDF", "Total Tables": n})
+                else:  # .docx
+                    n = count_tables_docx_xml(f)
+                    w.writerow({"File Path": str(f), "File Type": "DOCX", "Total Tables": n})
+            except Exception as e:
+                print(f"[error] {f}: {e}", file=sys.stderr)
+                # still write a row so you can see failures
+                w.writerow({"File Path": str(f), "File Type": f.suffix.upper().lstrip("."), "Total Tables": ""})
+
+            # lightweight progress
+            if idx % 50 == 0 or idx == total:
+                print(f"[progress] {idx}/{total} processed")
+
+    print(f"[done] Wrote {len(targets)} rows → {args.out}")
+
+if __name__ == "__main__":
+    main()
