@@ -11,24 +11,7 @@ def timestamped_outpath(out_path: Path) -> Path:
     stem, suf = out_path.stem, (out_path.suffix or ".csv")
     return out_path.with_name(f"{stem}__{ts}{suf}")
 
-def _preview_from_table(tbl, max_chars: int = 100) -> str:
-    """Build a short text preview from the first 1–2 rows."""
-    parts = []
-    try:
-        take_rows = min(2, len(tbl.rows))
-        for r in range(take_rows):
-            row_text = " | ".join(c.text.strip() for c in tbl.rows[r].cells)
-            if row_text:
-                parts.append(row_text)
-    except Exception:
-        pass
-    preview = " / ".join(parts).strip()
-    if len(preview) > max_chars:
-        preview = preview[:max_chars - 1] + "…"
-    return preview
-
 def _count_rows_cols(tbl):
-    """Safe row/column counts."""
     try:
         rows = len(tbl.rows)
     except Exception:
@@ -36,19 +19,42 @@ def _count_rows_cols(tbl):
     try:
         cols = len(tbl.columns)
     except Exception:
-        # Fallback: infer from first row
         try:
             cols = len(tbl.rows[0].cells)
         except Exception:
             cols = ""
     return rows, cols
 
-def _walk_tables(tables, location_label: str, results: list, file_path: Path, base_index: int, depth: int = 0):
-    """Record tables and (optionally) nested tables recursively."""
+def _table_has_text(tbl) -> bool:
+    for row in tbl.rows:
+        for cell in row.cells:
+            if cell.text and cell.text.strip():
+                return True
+    return False
+
+def _preview_from_table(tbl, max_non_empty_rows: int = 3, max_chars: int = 100) -> str:
+    """Preview from the first N non-empty rows; truncate to max_chars."""
+    parts = []
+    taken = 0
+    for r in range(len(tbl.rows)):
+        row_texts = [c.text.strip() for c in tbl.rows[r].cells]
+        # consider row non-empty if any cell has text
+        if any(row_texts):
+            parts.append(" | ".join(row_texts))
+            taken += 1
+            if taken >= max_non_empty_rows:
+                break
+    preview = " / ".join(p for p in parts if p)
+    if len(preview) > max_chars:
+        preview = preview[:max_chars - 1] + "…"
+    return preview
+
+def _walk_tables(tables, location_label: str, results: list, file_path: Path, base_index: int, depth: int, preview_rows: int):
     idx = base_index
     for tbl in tables:
         rows, cols = _count_rows_cols(tbl)
-        preview = _preview_from_table(tbl)
+        has_text = _table_has_text(tbl)
+        preview = _preview_from_table(tbl, max_non_empty_rows=preview_rows, max_chars=100)
 
         results.append({
             "File Path": str(file_path),
@@ -57,44 +63,39 @@ def _walk_tables(tables, location_label: str, results: list, file_path: Path, ba
             "Nested Depth": depth,
             "Rows": rows,
             "Columns": cols,
+            "Has Text": has_text,
             "Preview": preview
         })
         idx += 1
 
-        # Walk nested tables inside cells
+        # Recurse into nested tables
         for row in tbl.rows:
             for cell in row.cells:
                 if getattr(cell, "tables", None):
-                    idx = _walk_tables(cell.tables, location_label, results, file_path, idx, depth + 1)
+                    idx = _walk_tables(cell.tables, location_label, results, file_path, idx, depth + 1, preview_rows)
     return idx
 
-def locate_tables_in_docx(path: Path, include_hf: bool):
-    """
-    Return a list of table records for a single docx:
-    - Location: Body / Header (Section N) / Footer (Section N)
-    - Nested Depth: 0 = top-level, >0 = nested inside cells
-    - Rows, Columns, Preview
-    """
+def locate_tables_in_docx(path: Path, include_hf: bool, preview_rows: int):
     doc = Document(path)
     results = []
     next_idx = 1
 
     # Body tables
-    next_idx = _walk_tables(doc.tables, "Body", results, path, next_idx, depth=0)
+    next_idx = _walk_tables(doc.tables, "Body", results, path, next_idx, depth=0, preview_rows=preview_rows)
 
     # Headers/Footers per section
     if include_hf:
         for s_idx, section in enumerate(doc.sections, start=1):
             if section.header:
-                next_idx = _walk_tables(section.header.tables, f"Header (Section {s_idx})", results, path, next_idx, depth=0)
+                next_idx = _walk_tables(section.header.tables, f"Header (Section {s_idx})", results, path, next_idx, depth=0, preview_rows=preview_rows)
             if section.footer:
-                next_idx = _walk_tables(section.footer.tables, f"Footer (Section {s_idx})", results, path, next_idx, depth=0)
+                next_idx = _walk_tables(section.footer.tables, f"Footer (Section {s_idx})", results, path, next_idx, depth=0, preview_rows=preview_rows)
 
     return results
 
 def main():
     p = argparse.ArgumentParser(
-        description="Locate every table in .docx files with location, nested depth, row/col counts, and a text preview."
+        description="Locate every table in .docx files with location, nested depth, row/col counts, text flag, and a text preview."
     )
     p.add_argument("--root", type=Path, required=True, help="Root folder to search (recursively).")
     p.add_argument("--out", type=Path, default=Path("docx_table_locator.csv"),
@@ -103,6 +104,8 @@ def main():
                    help="Exclude tables in headers/footers.")
     p.add_argument("--no-timestamp", action="store_true",
                    help="Do NOT append timestamp to output filename.")
+    p.add_argument("--preview-rows", type=int, default=3,
+                   help="Number of non-empty rows to include in the preview (default: 3).")
     args = p.parse_args()
 
     if not args.root.exists():
@@ -110,12 +113,13 @@ def main():
 
     include_hf = not args.no_headers_footers
     out_path = args.out if args.no_timestamp else timestamped_outpath(args.out)
+    preview_rows = max(1, args.preview_rows)
 
     # [1/5] start + indexing
     files = list(args.root.rglob("*.docx"))
     print(f"[1/5] Indexed {len(files)} .docx files under {args.root}")
 
-    headers = ["File Path", "Table # (per file)", "Location", "Nested Depth", "Rows", "Columns", "Preview"]
+    headers = ["File Path", "Table # (per file)", "Location", "Nested Depth", "Rows", "Columns", "Has Text", "Preview"]
     all_rows = []
     total = len(files)
 
@@ -128,18 +132,16 @@ def main():
         return
 
     # Progress checkpoints: 25%, 50%, 75%
-    checkpoints = {0.25, 0.50, 0.75}
-    fired = set()
+    checkpoints, fired = (0.25, 0.50, 0.75), set()
 
     for idx, f in enumerate(files, start=1):
         try:
-            all_rows.extend(locate_tables_in_docx(f, include_hf=include_hf))
+            all_rows.extend(locate_tables_in_docx(f, include_hf=include_hf, preview_rows=preview_rows))
         except Exception as e:
             print(f"[error] {f}: {e}", file=sys.stderr)
 
-        # [2-4/5] milestones
         progress = idx / total
-        for cp in (0.25, 0.50, 0.75):
+        for cp in checkpoints:
             if progress >= cp and cp not in fired:
                 pct = int(cp * 100)
                 label = 2 if cp == 0.25 else 3 if cp == 0.50 else 4
