@@ -5,7 +5,7 @@ from datetime import datetime
 import pdfplumber
 
 # ---------------------------- PDF (pdfplumber) ------------------------------
-# Detection settings (tightened stream thresholds = Option 2)
+# Detection settings (Option 2 kept: tightened stream thresholds)
 LATTICE_SETTINGS = {"vertical_strategy": "lines", "horizontal_strategy": "lines"}
 STREAM_SETTINGS_BASE = {
     "vertical_strategy": "text",
@@ -20,7 +20,7 @@ STREAM_SETTINGS_STRICT = {
     "horizontal_strategy": "text",
     "text_tolerance": 0.25,          # tightened from 0.5
     "intersection_tolerance": 0.25,  # tightened from 0.5
-    "min_words_vertical": 5,
+    "min_words_vertical": 5
     "min_words_horizontal": 5,
 }
 
@@ -97,6 +97,22 @@ def _filter_tables(page, tables, min_rows, min_cols, min_fill, min_area, max_are
                 vetted.append(t)
     return vetted
 
+# ---------- Option 1: require drawn rulings for stream candidates ------------
+def _has_rulings(page, bbox, min_lines=3, min_len_frac=0.12):
+    x0, y0, x1, y1 = bbox
+    pw, ph = page.width, page.height
+    min_len = min(pw, ph) * min_len_frac
+    hits = 0
+    for ln in getattr(page, "lines", []):
+        lx0, ly0, lx1, ly1 = ln["x0"], ln["top"], ln["x1"], ln["bottom"]
+        # bbox intersection test
+        if not (x1 < min(lx0, lx1) or x0 > max(lx0, lx1) or y1 < min(ly0, ly1) or y0 > max(ly0, ly1)):
+            if abs(lx1 - lx0) >= min_len or abs(ly1 - ly0) >= min_len:
+                hits += 1
+                if hits >= min_lines:
+                    return True
+    return False
+
 def _count_tables_pdf_once(path: Path, mode: str, strict: bool):
     lattice_sum = 0
     stream_sum = 0
@@ -136,6 +152,8 @@ def _count_tables_pdf_once(path: Path, mode: str, strict: bool):
                 try:
                     tables = page.find_tables(table_settings=stream_settings)
                     tables = _filter_tables(page, tables, min_rows, min_cols, min_fill, min_area, max_area, aspect_min, aspect_max)
+                    # Option 1 gate: keep only stream boxes that include real drawn lines
+                    tables = [t for t in tables if _has_rulings(page, t.bbox)]
                     stream_boxes = [t.bbox for t in tables]
                     stream_sum += len(stream_boxes)
                 except Exception:
@@ -153,15 +171,15 @@ def _count_tables_pdf_once(path: Path, mode: str, strict: bool):
 
 def count_tables_pdf(path: Path, mode: str):
     """
-    Two-pass PDF counting: base pass, and (if Pages==TotalTables>0) strict pass.
+    Two-pass PDF counting: base pass, then a strict pass when totals are suspicious.
     Returns dict matching CSV columns, plus 'Original Total Tables' and 'Conservative Recount Applied'.
     """
     pages, img_only, lat_sum, str_sum, total = _count_tables_pdf_once(path, mode, strict=False)
     conservative = "No"
     original_total = total
 
-    if pages > 0 and total == pages:
-        # Suspect file: re-count with strict rules
+    # Option 4: broaden recount trigger
+    if pages > 0 and (total >= pages):
         _, _, lat_sum2, str_sum2, total2 = _count_tables_pdf_once(path, mode, strict=True)
         total, lat_sum, str_sum = total2, lat_sum2, str_sum2
         conservative = "Yes"
@@ -191,7 +209,7 @@ def timestamped_outpath(out_path: Path) -> Path:
 
 def main():
     p = argparse.ArgumentParser(
-        description="Count tables in PDFs (pdfplumber). Tightened stream thresholds to cut false positives. Recounts strictly if Pages == Total Tables."
+        description="Count tables in PDFs (pdfplumber). Tight stream thresholds + rulings gate for stream; strict recount if Total >= Pages."
     )
     p.add_argument("--root", type=Path, required=True, help="Root folder to search (recursively).")
     p.add_argument("--out", type=Path, default=Path("pdf_table_counts.csv"),
@@ -224,7 +242,6 @@ def main():
         "Total Tables","Original Total Tables","Conservative Recount Applied"
     ]
 
-    # Stream writes for robustness/speed
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with out_path.open("w", newline="", encoding="utf-8") as fp:
         w = csv.DictWriter(fp, fieldnames=headers)
