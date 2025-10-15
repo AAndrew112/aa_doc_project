@@ -1,58 +1,7 @@
-#!/usr/bin/env python3
-from pathlib import Path
-import argparse, csv, sys, logging, math
-from zipfile import ZipFile
-import xml.etree.ElementTree as ET
-import pdfplumber
-from collections import defaultdict, deque
+# -------- DOCX tabbed “tables” (precision-focused) --------
+POS_TOL_TWIPS = 60          # ~3 pt tolerance
+MIN_SPAN_TWIPS = 2500       # ~2.0 inches (1 inch = 1440 twips)
 
-# -------------------- Silence pdfminer/pdfplumber noisy logs --------------------
-for name in ("pdfminer", "pdfminer.pdfinterp", "pdfminer.converter", "pdfminer.layout"):
-    logging.getLogger(name).setLevel(logging.ERROR)
-
-# ========================== DOCX (XML-based) ==========================
-W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
-
-PARTS_TO_SCAN = {
-    "Body":       "word/document.xml",
-    "Footnotes":  "word/footnotes.xml",
-    "Endnotes":   "word/endnotes.xml",
-    "Comments":   "word/comments.xml",
-}
-
-def _list_header_footer_parts(zf: ZipFile):
-    headers, footers = [], []
-    for name in zf.namelist():
-        if name.startswith("word/header") and name.endswith(".xml"):
-            headers.append(name)
-        elif name.startswith("word/footer") and name.endswith(".xml"):
-            footers.append(name)
-    return headers, footers
-
-def _localname(tag: str) -> str:
-    return tag.split("}", 1)[1] if tag and tag.startswith("{") else tag
-
-def _count_tbls_in_part(zf: ZipFile, part_name: str) -> int:
-    try:
-        xml = zf.read(part_name)
-    except KeyError:
-        return 0
-    root = ET.fromstring(xml)
-    return sum(1 for _ in root.iter(f"{{{W_NS}}}tbl"))
-
-def count_tables_docx_real(path: Path) -> int:
-    total = 0
-    with ZipFile(path) as zf:
-        for _, part in PARTS_TO_SCAN.items():
-            total += _count_tbls_in_part(zf, part)
-        headers, footers = _list_header_footer_parts(zf)
-        for part in headers:
-            total += _count_tbls_in_part(zf, part)
-        for part in footers:
-            total += _count_tbls_in_part(zf, part)
-    return total
-
-# -------- DOCX tabbed “tables” (pseudo-tables made with tabs) --------
 def _docx_iter_paragraphs(zf: ZipFile):
     try:
         root = ET.fromstring(zf.read("word/document.xml"))
@@ -60,14 +9,36 @@ def _docx_iter_paragraphs(zf: ZipFile):
         return []
     return list(root.iter(f"{{{W_NS}}}p"))
 
-def _count_tabs_in_para(p_el) -> int:
-    # Count <w:tab/> occurrences in a paragraph
-    return sum(1 for el in p_el.iter() if _localname(el.tag) == "tab")
+def _para_tabstop_positions(p_el):
+    pPr = p_el.find(f"{{{W_NS}}}pPr")
+    if pPr is None: return None
+    tabs = pPr.find(f"{{{W_NS}}}tabs")
+    if tabs is None: return None
+    pos = []
+    for t in tabs.findall(f"{{{W_NS}}}tab"):
+        val = t.get(f"{{{W_NS}}}pos")
+        if val and val.isdigit():
+            pos.append(int(val))
+    if len(pos) < 2:  # need at least 2 stops to imply ≥3 cols
+        return None
+    pos = sorted(pos)
+    # enforce overall span (filters header/signature indents)
+    if pos[-1] - pos[0] < MIN_SPAN_TWIPS:
+        return None
+    return pos
 
-def count_tables_docx_tabbed(path: Path, min_cols=3, min_rows=3) -> int:
+def _aligned(pos_a, pos_b, tol=POS_TOL_TWIPS):
+    if len(pos_a) != len(pos_b): return False
+    return all(abs(a - b) <= tol for a, b in zip(pos_a, pos_b))
+
+def count_tables_docx_tabbed(path: Path, min_cols=3, min_rows=3, allow_two_rows=False) -> int:
     """
-    Heuristic: a 'tab table' is a run of >= min_rows consecutive paragraphs
-    where each paragraph has >= (min_cols-1) tabs and the tab counts are equal.
+    A 'tab table' = run of >= min_rows consecutive paragraphs with:
+      • explicit tab-stop positions present,
+      • at least (min_cols-1) tab stops,
+      • same tab-stop positions (± tol) across the run,
+      • overall tab-span ≥ MIN_SPAN_TWIPS (~2 in).
+    Set allow_two_rows=True to accept 2-row runs (default False).
     """
     try:
         with ZipFile(path) as zf:
@@ -75,308 +46,39 @@ def count_tables_docx_tabbed(path: Path, min_cols=3, min_rows=3) -> int:
     except Exception:
         return 0
 
-    rows = [(i, _count_tabs_in_para(p)) for i, p in enumerate(paras)]
-    rows = [(i, t) for i, t in rows if t >= (min_cols - 1)]
+    # collect paragraphs with usable tab-stop positions
+    rows = []
+    for i, p in enumerate(paras):
+        pos = _para_tabstop_positions(p)
+        if pos is not None and len(pos) >= (min_cols - 1):
+            rows.append((i, pos))
+
     if not rows:
         return 0
 
-    tab_tables = 0
-    run_len = 0
-    prev_i = None
-    prev_t = None
+    need_rows = 2 if allow_two_rows else max(3, min_rows)
+    tab_tables, run = 0, []
 
-    for i, t in rows:
-        if prev_i is not None and i == prev_i + 1 and t == prev_t:
-            run_len += 1
-        else:
-            if run_len >= min_rows:
+    def finalize():
+        nonlocal tab_tables, run
+        if len(run) >= need_rows:
+            base = run[0][1]
+            if all(_aligned(base, r[1]) for r in run[1:]):
                 tab_tables += 1
-            run_len = 1
-        prev_i, prev_t = i, t
+        run = []
 
-    if run_len >= min_rows:
-        tab_tables += 1
-
-    return tab_tables
-
-def count_tables_docx_total(path: Path) -> int:
-    return count_tables_docx_real(path) + count_tables_docx_tabbed(path)
-
-# ========================== PDF (lattice-only, higher recall) ==========================
-# Looser knobs to catch faint/short/near-header rulings and slight rotation
-SNAP_TOL = 4.0              # was 3.0
-MIN_LINE_LEN_FRAC = 0.03    # was 0.06 (accept shorter lines)
-MIN_V_LINES = 2             # was 3
-MIN_H_LINES = 2             # was 3
-MIN_INTERSECTIONS = 3       # was 4
-MIN_AREA_FRAC = 0.015
-MAX_AREA_FRAC = 0.60
-ASPECT_MIN = 0.33
-ASPECT_MAX = 3.0
-HEADER_FOOTER_IGNORE = 0.06 # was 0.10 (don’t over-prune header regions)
-MERGE_VGAP_FRAC = 0.02
-MERGE_H_OVERLAP = 0.60
-ANG_TOL = 10  # degrees; accept lines within ±10° of horizontal/vertical
-
-def _angle_deg(x0, y0, x1, y1):
-    return abs(math.degrees(math.atan2((y1 - y0), (x1 - x0))))
-
-def _is_vertical(ln):   # accept near-vertical within ANG_TOL
-    ang = _angle_deg(ln["x0"], ln["top"], ln["x1"], ln["bottom"])
-    return ang >= (90 - ANG_TOL)
-
-def _is_horizontal(ln): # accept near-horizontal within ANG_TOL
-    ang = _angle_deg(ln["x0"], ln["top"], ln["x1"], ln["bottom"])
-    return ang <= ANG_TOL
-
-def _line_length(ln):
-    # projected length along the dominant axis is fine here
-    if _is_vertical(ln):
-        return abs(ln["bottom"] - ln["top"])
-    return abs(ln["x1"] - ln["x0"])
-
-def _cluster_coords(values, tol):
-    if not values:
-        return [], {}
-    vals = sorted((v, i) for i, v in enumerate(values))
-    centers = []
-    bucket = [vals[0][0]]
-    for (v, _i) in vals[1:]:
-        if abs(v - bucket[-1]) <= tol:
-            bucket.append(v)
+    prev_i = None
+    for rec in rows:
+        i, pos = rec
+        if prev_i is not None and i == prev_i + 1:
+            if not run:
+                # include previous row as start
+                prev = next((r for r in rows if r[0] == prev_i), None)
+                if prev: run.append(prev)
+            run.append(rec)
         else:
-            centers.append(sum(bucket)/len(bucket))
-            bucket = [v]
-    centers.append(sum(bucket)/len(bucket))
-    idx_map = {}
-    for (v, i) in vals:
-        nearest = min(range(len(centers)), key=lambda k: abs(v - centers[k]))
-        idx_map[i] = nearest
-    return centers, idx_map
-
-def _bbox_area_aspect(bbox, pw, ph):
-    x0,y0,x1,y1 = bbox
-    w = max(0.0, x1 - x0); h = max(0.0, y1 - y0)
-    if pw <= 0 or ph <= 0 or w == 0 or h == 0:
-        return 0.0, 0.0
-    return (w*h)/(pw*ph), (w/h)
-
-def _merge_nearby(boxes, pw, ph, vgap_frac=MERGE_VGAP_FRAC, min_h_overlap=MERGE_H_OVERLAP):
-    if not boxes: return boxes
-    vgap = ph * vgap_frac
-    def h_overlap(a,b):
-        ax0,ax1 = a[0],a[2]; bx0,bx1 = b[0],b[2]
-        inter = max(0, min(ax1,bx1) - max(ax0,bx0))
-        return inter / max(1e-9, min(ax1-ax0, bx1-bx0))
-    bs = sorted(boxes, key=lambda b:(b[1], b[0]))
-    changed = True
-    while changed:
-        changed = False
-        out = []
-        i = 0
-        while i < len(bs):
-            cur = bs[i]; j = i+1
-            merged = cur
-            while j < len(bs):
-                nxt = bs[j]
-                if 0 <= nxt[1] - merged[3] <= vgap and h_overlap(merged, nxt) >= min_h_overlap:
-                    merged = (min(merged[0], nxt[0]),
-                              min(merged[1], nxt[1]),
-                              max(merged[2], nxt[2]),
-                              max(merged[3], nxt[3]))
-                    j += 1; changed = True
-                else:
-                    break
-            out.append(merged); i = j
-        bs = out
-    return bs
-
-def detect_tables_lattice(page):
-    """Return list of table bounding boxes using drawn line grids + rect/curve edges."""
-    pw, ph = page.width, page.height
-    min_len = min(pw, ph) * MIN_LINE_LEN_FRAC
-
-    v_lines_raw, h_lines_raw = [], []
-
-    # 1) Native lines (accept slight rotation via _is_vertical/_is_horizontal)
-    for ln in getattr(page, "lines", []):
-        if _line_length(ln) < min_len:
-            continue
-        if _is_vertical(ln):
-            x = (ln["x0"] + ln["x1"]) / 2.0
-            v_lines_raw.append((x, min(ln["top"], ln["bottom"]), max(ln["top"], ln["bottom"])))
-        elif _is_horizontal(ln):
-            y = (ln["top"] + ln["bottom"]) / 2.0
-            h_lines_raw.append((y, min(ln["x0"], ln["x1"]), max(ln["x0"], ln["x1"])))
-
-    # 2) Rectangle edges as lines
-    for rc in getattr(page, "rects", []):
-        x0, y0, x1, y1 = rc["x0"], rc["y0"], rc["x1"], rc["y1"]
-        w, h = abs(x1 - x0), abs(y1 - y0)
-        if w >= min_len:
-            y_top = min(y0, y1); y_bot = max(y0, y1)
-            h_lines_raw.append((y_top, min(x0, x1), max(x0, x1)))
-            h_lines_raw.append((y_bot, min(x0, x1), max(x0, x1)))
-        if h >= min_len:
-            x_left = min(x0, x1); x_right = max(x0, x1)
-            v_lines_raw.append((x_left, min(y0, y1), max(y0, y1)))
-            v_lines_raw.append((x_right, min(y0, y1), max(y0, y1)))
-
-    # 3) Near-axis curves as lines
-    for cv in getattr(page, "curves", []):
-        x0, y0, x1, y1 = cv["x0"], cv["y0"], cv["x1"], cv["y1"]
-        dx, dy = abs(x1 - x0), abs(y1 - y0)
-        if max(dx, dy) < min_len:
-            continue
-        ang = _angle_deg(x0, y0, x1, y1)
-        if ang <= ANG_TOL:  # near-horizontal
-            y = (y0 + y1) / 2.0
-            h_lines_raw.append((y, min(x0, x1), max(x0, x1)))
-        elif ang >= (90 - ANG_TOL):  # near-vertical
-            x = (x0 + x1) / 2.0
-            v_lines_raw.append((x, min(y0, y1), max(y0, y1)))
-
-    if not v_lines_raw or not h_lines_raw:
-        return []
-
-    # Snap parallel lines
-    vx_vals = [x for (x,_,_) in v_lines_raw]
-    vy_vals = [y for (y,_,_) in h_lines_raw]
-    vx_centers, vx_map_idx = _cluster_coords(vx_vals, SNAP_TOL)
-    vy_centers, vy_map_idx = _cluster_coords(vy_vals, SNAP_TOL)
-
-    v_by_ix = defaultdict(list)
-    for idx,(x,y0,y1) in enumerate(v_lines_raw):
-        v_by_ix[vx_map_idx[idx]].append((x,y0,y1))
-    h_by_iy = defaultdict(list)
-    for idx,(y,x0,x1) in enumerate(h_lines_raw):
-        h_by_iy[vy_map_idx[idx]].append((y,x0,x1))
-
-    # Collapse to maximal extents per snapped line
-    v_lines = []  # (ix, x, y0, y1)
-    for ix, segs in v_by_ix.items():
-        x = vx_centers[ix]
-        y0 = min(s[1] for s in segs); y1 = max(s[2] for s in segs)
-        v_lines.append((ix, x, y0, y1))
-    h_lines = []  # (iy, y, x0, x1)
-    for iy, segs in h_by_iy.items():
-        y = vy_centers[iy]
-        x0 = min(s[1] for s in segs); x1 = max(s[2] for s in segs)
-        h_lines.append((iy, y, x0, x1))
-
-    if len(v_lines) < MIN_V_LINES or len(h_lines) < MIN_H_LINES:
-        return []
-
-    # Intersections -> bipartite graph
-    adj = defaultdict(set)
-    intersections = set()
-    tol = SNAP_TOL
-    for ix, x, vy0, vy1 in v_lines:
-        for iy, y, hx0, hx1 in h_lines:
-            if (vy0 - tol) <= y <= (vy1 + tol) and (hx0 - tol) <= x <= (hx1 + tol):
-                adj[("v", ix)].add(("h", iy))
-                adj[("h", iy)].add(("v", ix))
-                intersections.add((ix, iy))
-
-    if len(intersections) < MIN_INTERSECTIONS:
-        return []
-
-    # Connected components -> candidate boxes
-    seen = set(); boxes = []
-    nodes = set(adj.keys())
-    for node in list(nodes):
-        if node in seen: continue
-        comp = set(); q = deque([node]); seen.add(node)
-        while q:
-            u = q.popleft(); comp.add(u)
-            for v in adj[u]:
-                if v not in seen:
-                    seen.add(v); q.append(v)
-
-        v_ix = sorted(n[1] for n in comp if n[0] == "v")
-        h_iy = sorted(n[1] for n in comp if n[0] == "h")
-        if len(v_ix) < MIN_V_LINES or len(h_iy) < MIN_H_LINES:
-            continue
-
-        comp_inters = [(ix, iy) for (ix, iy) in intersections if ix in v_ix and iy in h_iy]
-        if len(comp_inters) < MIN_INTERSECTIONS:
-            continue
-
-        xs = [vx_centers[ix] for ix in v_ix]
-        ys = [vy_centers[iy] for iy in h_iy]
-        x0, x1 = min(xs) - tol, max(xs) + tol
-        y0, y1 = min(ys) - tol, max(ys) + tol
-        bbox = (max(0, x0), max(0, y0), min(pw, x1), min(ph, y1))
-
-        area_frac, aspect = _bbox_area_aspect(bbox, pw, ph)
-        if not (MIN_AREA_FRAC <= area_frac <= MAX_AREA_FRAC and ASPECT_MIN <= aspect <= ASPECT_MAX):
-            continue
-
-        # Keep header/footer candidates (we already lowered HEADER_FOOTER_IGNORE)
-        if y1 <= ph * HEADER_FOOTER_IGNORE or y0 >= ph * (1.0 - HEADER_FOOTER_IGNORE):
-            # If you still want to exclude ultra-thin letterhead lines, uncomment next line:
-            # continue
-            pass
-
-        boxes.append(bbox)
-
-    return _merge_nearby(boxes, pw, ph, MERGE_VGAP_FRAC, MERGE_H_OVERLAP)
-
-def count_tables_pdf(path: Path) -> int:
-    total = 0
-    try:
-        with pdfplumber.open(path) as pdf:
-            for page in pdf.pages:
-                total += len(detect_tables_lattice(page))
-    except Exception as e:
-        print(f"[error:pdf] {path}: {e}", file=sys.stderr)
-        return 0
-    return total
-
-# ================================ Runner =================================
-def main():
-    p = argparse.ArgumentParser(
-        description="Count tables in DOCX (real + tabbed) and PDF (lattice-only, higher recall). Outputs: File Path, File Type, Total Tables."
-    )
-    p.add_argument("--root", type=Path, required=True, help="Root folder to search (recursively).")
-    p.add_argument("--out", type=Path, default=Path("universal_table_counts.csv"),
-                   help="Output CSV filename.")
-    args = p.parse_args()
-
-    if not args.root.exists():
-        p.error(f"--root path does not exist: {args.root}")
-
-    targets = [p for p in args.root.rglob("*") if p.suffix.lower() in (".pdf", ".docx")]
-    targets.sort()
-
-    headers = ["File Path", "File Type", "Total Tables"]
-    args.out.parent.mkdir(parents=True, exist_ok=True)
-
-    with args.out.open("w", newline="", encoding="utf-8") as fp:
-        w = csv.DictWriter(fp, fieldnames=headers)
-        w.writeheader()
-
-        total = len(targets)
-        if total == 0:
-            print(f"[done] No .pdf/.docx files under {args.root}")
-            return
-
-        for idx, f in enumerate(targets, start=1):
-            try:
-                if f.suffix.lower() == ".pdf":
-                    n = count_tables_pdf(f)
-                    w.writerow({"File Path": str(f), "File Type": "PDF", "Total Tables": n})
-                else:  # .docx
-                    n = count_tables_docx_total(f)
-                    w.writerow({"File Path": str(f), "File Type": "DOCX", "Total Tables": n})
-            except Exception as e:
-                print(f"[error] {f}: {e}", file=sys.stderr)
-                w.writerow({"File Path": str(f), "File Type": f.suffix.upper().lstrip("."), "Total Tables": ""})
-
-            if idx % 100 == 0 or idx == total:
-                print(f"[progress] {idx}/{total} processed")
-
-    print(f"[done] Wrote {len(targets)} rows → {args.out}")
-
-if __name__ == "__main__":
-    main()
+            finalize()
+            run = [rec]
+        prev_i = i
+    finalize()
+    return tab_tables
