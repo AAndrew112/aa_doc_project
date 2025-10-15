@@ -1,0 +1,149 @@
+#!/usr/bin/env python3
+"""
+Scan .docx files recursively and count "tabbed tables" (tables laid out with tab characters).
+Outputs a CSV with columns: File Path, Tabbed Table Count.
+
+Usage:
+  python tabbed_table_scan.py --root /path/to/top/folder
+"""
+
+import argparse
+import csv
+import sys
+from pathlib import Path
+from typing import Set
+
+from docx import Document
+
+
+def _paragraph_elements_inside_real_tables(doc: Document) -> Set[object]:
+    """
+    Collect the underlying XML <w:p> elements for all paragraphs that live inside
+    real Word tables so we can exclude them from "tabbed table" detection.
+    """
+    p_elems = set()
+    for tbl in doc.tables:
+        for row in tbl.rows:
+            for cell in row.cells:
+                # cell.paragraphs are python-docx Paragraph objects
+                for par in cell.paragraphs:
+                    p_elems.add(par._p)  # _p is the lxml object for <w:p>
+    return p_elems
+
+
+def _is_tab_row(text: str, min_tabs: int = 2) -> bool:
+    """
+    Heuristic: a "tab row" is a non-empty line with at least `min_tabs` tab characters
+    and content in multiple columns (not just tabs/spaces).
+    """
+    if not text:
+        return False
+    tab_count = text.count("\t")
+    if tab_count < min_tabs:
+        return False
+
+    # Require at least half the split parts to contain some non-space characters.
+    parts = text.split("\t")
+    if len(parts) < (min_tabs + 1):
+        return False
+    nonempty = sum(1 for p in parts if p.strip() != "")
+    return nonempty >= max(2, len(parts) // 2)
+
+
+def count_tabbed_tables(doc: Document) -> int:
+    """
+    Count groups of consecutive "tab rows" (paragraphs with >=2 tabs) that look like a manual table.
+
+    Rules:
+      - Ignore paragraphs that are inside real Word tables.
+      - A group must have >= 2 consecutive tab rows.
+      - Allow the number of columns to vary by at most 1 within a group.
+    """
+    in_table_p = _paragraph_elements_inside_real_tables(doc)
+
+    count = 0
+    current_len = 0
+    current_cols = None
+
+    def close_group():
+        nonlocal count, current_len, current_cols
+        if current_len >= 2:
+            count += 1
+        current_len = 0
+        current_cols = None
+
+    for par in doc.paragraphs:
+        # Skip paragraphs that belong to real tables
+        if par._p in in_table_p:
+            if current_len:
+                close_group()
+            continue
+
+        text = par.text or ""
+        if _is_tab_row(text, min_tabs=2):
+            cols = text.count("\t") + 1
+            if current_len == 0:
+                current_len = 1
+                current_cols = cols
+            else:
+                # keep group going if column count is consistent (+/- 1)
+                if current_cols is None or abs(cols - current_cols) <= 1:
+                    current_len += 1
+                else:
+                    # close previous group and start a new one
+                    close_group()
+                    current_len = 1
+                    current_cols = cols
+        else:
+            if current_len:
+                close_group()
+
+    # finalize any open group
+    if current_len:
+        close_group()
+
+    return count
+
+
+def process_root(root: Path, out_csv: Path) -> None:
+    """
+    Walk `root` recursively, process all .docx files, and write CSV.
+    Always include files with a 0 count.
+    """
+    files = sorted(root.rglob("*.docx"))
+    with out_csv.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["File Path", "Tabbed Table Count"])
+
+        for fp in files:
+            try:
+                doc = Document(str(fp))
+                tabbed_count = count_tabbed_tables(doc)
+            except Exception as e:
+                # On read/parsing error, record 0 and continue; also log to stderr.
+                tabbed_count = 0
+                print(f"[WARN] Failed to read {fp}: {e}", file=sys.stderr)
+            writer.writerow([str(fp), tabbed_count])
+
+
+def main():
+    p = argparse.ArgumentParser(description="Count tab-created tables in .docx files.")
+    p.add_argument(
+        "--root",
+        required=True,
+        help="Top-level folder to scan recursively for .docx files.",
+    )
+    args = p.parse_args()
+
+    root = Path(args.root).expanduser().resolve()
+    if not root.exists():
+        print(f"[ERROR] Root path not found: {root}", file=sys.stderr)
+        sys.exit(1)
+
+    out_csv = Path("tabbed_tables.csv")
+    process_root(root, out_csv)
+    print(f"Done. Wrote: {out_csv.resolve()}")
+
+
+if __name__ == "__main__":
+    main()
