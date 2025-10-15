@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Scan .docx files recursively and count "tabbed tables" (tables laid out with tab characters).
-Outputs a CSV with columns: File Path, Tabbed Table Count.
+Recursively scan .docx files and count "tabbed tables" (blocks of lines aligned with TABs).
+Writes CSV with: File Path, Tabbed Table Count, Tabbed Table Sample
 
 Usage:
   python tabbed_table_scan.py --root /path/to/top/folder
@@ -11,30 +11,55 @@ import argparse
 import csv
 import sys
 from pathlib import Path
-from typing import Set
+from typing import Set, List, Optional
 
 from docx import Document
 
 
-def _paragraph_elements_inside_real_tables(doc: Document) -> Set[object]:
-    """
-    Collect the underlying XML <w:p> elements for all paragraphs that live inside
-    real Word tables so we can exclude them from "tabbed table" detection.
-    """
-    p_elems = set()
+# ---------- Helpers to exclude non-body content ----------
+
+def _paragraph_elements_in_real_tables(doc: Document) -> Set[object]:
+    """Collect XML <w:p> elements for paragraphs inside real Word tables (to exclude)."""
+    elems = set()
     for tbl in doc.tables:
         for row in tbl.rows:
             for cell in row.cells:
-                # cell.paragraphs are python-docx Paragraph objects
                 for par in cell.paragraphs:
-                    p_elems.add(par._p)  # _p is the lxml object for <w:p>
-    return p_elems
+                    elems.add(par._p)
+    return elems
 
+
+def _paragraph_elements_in_headers_footers(doc: Document) -> Set[object]:
+    """Collect XML <w:p> elements for paragraphs living in headers/footers (to exclude)."""
+    elems = set()
+    for sect in doc.sections:
+        for hf in (sect.header, sect.first_page_header, sect.even_page_header,
+                   sect.footer, sect.first_page_footer, sect.even_page_footer):
+            if hf is None:
+                continue
+            for par in hf.paragraphs:
+                elems.add(par._p)
+    return elems
+
+
+def _is_list_paragraph(par) -> bool:
+    """
+    Heuristic: skip numbered/bulleted list items.
+    Detects presence of <w:numPr> in the paragraph properties.
+    """
+    pPr = par._p.pPr
+    if pPr is None:
+        return False
+    # hasattr guards because python-docx may not expose everything uniformly
+    return getattr(pPr, "numPr", None) is not None
+
+
+# ---------- Tabbed-row / group detection ----------
 
 def _is_tab_row(text: str, min_tabs: int = 2) -> bool:
     """
-    Heuristic: a "tab row" is a non-empty line with at least `min_tabs` tab characters
-    and content in multiple columns (not just tabs/spaces).
+    A "tab row" is a non-empty line with at least `min_tabs` TAB characters and
+    real content in multiple columns (to avoid counting indents).
     """
     if not text:
         return False
@@ -42,88 +67,122 @@ def _is_tab_row(text: str, min_tabs: int = 2) -> bool:
     if tab_count < min_tabs:
         return False
 
-    # Require at least half the split parts to contain some non-space characters.
-    parts = text.split("\t")
-    if len(parts) < (min_tabs + 1):
+    parts = [p.strip() for p in text.split("\t")]
+    # Require at least 2 non-empty columns and most columns not empty
+    nonempty = sum(1 for p in parts if p)
+    if nonempty < 2:
         return False
-    nonempty = sum(1 for p in parts if p.strip() != "")
     return nonempty >= max(2, len(parts) // 2)
 
 
-def count_tabbed_tables(doc: Document) -> int:
+def _close_group(current_len: int, snippet_lines: List[str], snippets: List[str]) -> None:
     """
-    Count groups of consecutive "tab rows" (paragraphs with >=2 tabs) that look like a manual table.
+    Close a current group if it qualifies (>=2 tab rows) and stash a compact snippet.
+    """
+    if current_len >= 2:
+        # Build a short, single-line sample from the first 2 rows
+        sample = " / ".join(s.strip() for s in snippet_lines[:2] if s.strip())
+        # Keep sample reasonably short
+        if len(sample) > 200:
+            sample = sample[:197] + "..."
+        snippets.append(sample)
+
+
+def count_tabbed_tables_and_snippet(doc: Document) -> (int, Optional[str]):
+    """
+    Count tabbed-table groups and return (count, first_snippet_or_None).
 
     Rules:
-      - Ignore paragraphs that are inside real Word tables.
-      - A group must have >= 2 consecutive tab rows.
-      - Allow the number of columns to vary by at most 1 within a group.
+      - Exclude paragraphs in real tables and headers/footers.
+      - Exclude numbered/bulleted list paragraphs.
+      - A group = >=2 consecutive tab rows.
+      - Allow column count variation of +/- 1 across the group.
+      - Do NOT break a group on a single blank/whitespace-only line (wrap tolerance = 1).
     """
-    in_table_p = _paragraph_elements_inside_real_tables(doc)
+    in_tables = _paragraph_elements_in_real_tables(doc)
+    in_hdrftr = _paragraph_elements_in_headers_footers(doc)
 
-    count = 0
+    snippets: List[str] = []
     current_len = 0
     current_cols = None
+    snippet_lines: List[str] = []
+    gap_tolerance = 1
+    gaps = 0  # number of consecutive blank lines tolerated within a group
 
     def close_group():
-        nonlocal count, current_len, current_cols
-        if current_len >= 2:
-            count += 1
+        nonlocal current_len, current_cols, snippet_lines, gaps
+        _close_group(current_len, snippet_lines, snippets)
         current_len = 0
         current_cols = None
+        snippet_lines = []
+        gaps = 0
 
     for par in doc.paragraphs:
-        # Skip paragraphs that belong to real tables
-        if par._p in in_table_p:
+        if par._p in in_tables or par._p in in_hdrftr:
+            if current_len:
+                close_group()
+            continue
+        if _is_list_paragraph(par):
+            # Lists often include tabs for numbering; skip them.
             if current_len:
                 close_group()
             continue
 
         text = par.text or ""
-        if _is_tab_row(text, min_tabs=2):
+        if _is_tab_row(text, min_tabs=2):  # require >= 3 apparent columns
             cols = text.count("\t") + 1
             if current_len == 0:
                 current_len = 1
                 current_cols = cols
+                snippet_lines = [text]
+                gaps = 0
             else:
-                # keep group going if column count is consistent (+/- 1)
+                # Continue group if columns roughly consistent
                 if current_cols is None or abs(cols - current_cols) <= 1:
                     current_len += 1
+                    snippet_lines.append(text)
+                    gaps = 0
                 else:
-                    # close previous group and start a new one
+                    # Column count jump → end previous group, start new one
                     close_group()
                     current_len = 1
                     current_cols = cols
+                    snippet_lines = [text]
+                    gaps = 0
         else:
+            # Non-tab line: allow ONE blank/whitespace-only line inside a group
+            if current_len > 0 and (text.strip() == "") and gaps < gap_tolerance:
+                gaps += 1
+                # Keep group open
+                continue
+            # Otherwise, close any open group
             if current_len:
                 close_group()
 
-    # finalize any open group
+    # finalize
     if current_len:
         close_group()
 
-    return count
+    count = len(snippets)
+    return count, (snippets[0] if snippets else None)
 
+
+# ---------- Filesystem + CSV ----------
 
 def process_root(root: Path, out_csv: Path) -> None:
-    """
-    Walk `root` recursively, process all .docx files, and write CSV.
-    Always include files with a 0 count.
-    """
     files = sorted(root.rglob("*.docx"))
     with out_csv.open("w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
-        writer.writerow(["File Path", "Tabbed Table Count"])
+        writer.writerow(["File Path", "Tabbed Table Count", "Tabbed Table Sample"])
 
         for fp in files:
             try:
                 doc = Document(str(fp))
-                tabbed_count = count_tabbed_tables(doc)
+                count, sample = count_tabbed_tables_and_snippet(doc)
             except Exception as e:
-                # On read/parsing error, record 0 and continue; also log to stderr.
-                tabbed_count = 0
+                count, sample = 0, None
                 print(f"[WARN] Failed to read {fp}: {e}", file=sys.stderr)
-            writer.writerow([str(fp), tabbed_count])
+            writer.writerow([str(fp), count, (sample or "")])
 
 
 def main():
