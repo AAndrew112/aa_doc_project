@@ -1,21 +1,35 @@
 #!/usr/bin/env python3
 from pathlib import Path
-import argparse, csv, sys, re, logging
+import argparse, csv, re
 from zipfile import ZipFile
 import xml.etree.ElementTree as ET
-import pdfplumber
 
-# ---------------- Silence noisy logs ----------------
-for name in ("pdfminer", "pdfminer.pdfinterp", "pdfminer.converter", "pdfminer.layout"):
-    logging.getLogger(name).setLevel(logging.ERROR)
-
-# ---------------- Shared constants ----------------
 W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+NS = {"w": W_NS}
 WORD_RE = re.compile(r"\boption\b", re.IGNORECASE)
 
-# ---------------- DOCX ----------------
+def is_highlighted_run(r_el, para_highlight):
+    """Return True if this run or its paragraph is highlighted."""
+    rPr = r_el.find("w:rPr", NS)
+    if rPr is not None:
+        h = rPr.find("w:highlight", NS)
+        if h is not None and (h.get(f"{{{W_NS}}}val") or "yes") != "none":
+            return True
+    # fallback to paragraph-level highlight
+    return para_highlight
+
+def get_para_highlight(p_el):
+    """Return True if paragraph itself is highlighted."""
+    pPr = p_el.find("w:pPr", NS)
+    if pPr is None:
+        return False
+    h = pPr.find("w:highlight", NS)
+    if h is not None and (h.get(f"{{{W_NS}}}val") or "yes") != "none":
+        return True
+    return False
+
 def count_highlighted_option_docx(path: Path) -> int:
-    """Count occurrences of the word 'option' that are highlighted in DOCX."""
+    """Count all highlighted 'option' words in a .docx file."""
     try:
         with ZipFile(path) as zf:
             xml = zf.read("word/document.xml")
@@ -27,120 +41,59 @@ def count_highlighted_option_docx(path: Path) -> int:
     except Exception:
         return 0
 
-    ns = {"w": W_NS}
     total = 0
-    for r in root.iter(f"{{{W_NS}}}r"):
-        rPr = r.find("w:rPr", ns)
-        if rPr is None:
-            continue
-        h = rPr.find("w:highlight", ns)
-        if h is None:
-            continue
-        val = h.get(f"{{{W_NS}}}val")
-        if val == "none":
-            continue
+    for p in root.iter(f"{{{W_NS}}}p"):
+        para_highlight = get_para_highlight(p)
+        runs = list(p.findall("w:r", NS))
+        merged_segments = []
+        current = []
+        for r in runs:
+            if is_highlighted_run(r, para_highlight):
+                # accumulate text from highlighted runs
+                texts = [t.text or "" for t in r.findall("w:t", NS)]
+                run_text = "".join(texts)
+                current.append(run_text)
+            else:
+                if current:
+                    merged_segments.append("".join(current))
+                    current = []
+        if current:
+            merged_segments.append("".join(current))
 
-        texts = [t.text or "" for t in r.findall("w:t", ns)]
-        if not texts:
-            continue
-        run_text = "".join(texts)
-        total += len(WORD_RE.findall(run_text))
+        # Count word matches in all merged highlighted segments
+        for seg in merged_segments:
+            # Normalize punctuation spacing
+            cleaned = re.sub(r"[^A-Za-z]", " ", seg)
+            total += len(WORD_RE.findall(cleaned))
     return total
 
-# ---------------- PDF ----------------
-def _bbox_from_quadpoints(quadpoints):
-    boxes = []
-    if not quadpoints:
-        return boxes
-    q = list(quadpoints)
-    for i in range(0, len(q), 8):
-        xs = [q[i+0], q[i+2], q[i+4], q[i+6]]
-        ys = [q[i+1], q[i+3], q[i+5], q[i+7]]
-        x0, x1 = min(xs), max(xs)
-        top, bottom = min(ys), max(ys)
-        boxes.append((x0, top, x1, bottom))
-    return boxes
 
-def count_highlighted_option_pdf(path: Path) -> int:
-    """Count occurrences of the word 'option' that are highlighted in a PDF."""
-    total = 0
-    try:
-        with pdfplumber.open(path) as pdf:
-            for page in pdf.pages:
-                annots = getattr(page, "annots", None)
-                if not annots:
-                    continue
-                for a in annots:
-                    try:
-                        subtype = (a.get("subtype") or a.get("Subtype") or "").lower()
-                        if subtype != "highlight":
-                            continue
-                        boxes = []
-                        if "quadpoints" in a and a["quadpoints"]:
-                            boxes.extend(_bbox_from_quadpoints(a["quadpoints"]))
-                        elif "QuadPoints" in a and a["QuadPoints"]:
-                            boxes.extend(_bbox_from_quadpoints(a["QuadPoints"]))
-                        elif "rect" in a and a["rect"]:
-                            r = a["rect"]
-                            boxes.append((r[0], r[1], r[2], r[3]))
-                        elif "Rect" in a and a["Rect"]:
-                            r = a["Rect"]
-                            boxes.append((r[0], r[1], r[2], r[3]))
-                        if not boxes:
-                            continue
-
-                        for (x0, top, x1, bottom) in boxes:
-                            try:
-                                with page.crop((x0, top, x1, bottom)) as cp:
-                                    txt = cp.extract_text() or ""
-                            except Exception:
-                                txt = ""
-                            if not txt:
-                                continue
-                            total += len(WORD_RE.findall(txt))
-                    except Exception:
-                        continue
-    except Exception:
-        return 0
-    return total
-
-# ---------------- Runner ----------------
 def main():
-    ap = argparse.ArgumentParser(
-        description="Count highlighted occurrences of 'option' in DOCX and PDF files (case-insensitive)."
+    p = argparse.ArgumentParser(
+        description="Count highlighted occurrences of the word 'option' in DOCX files (high accuracy)."
     )
-    ap.add_argument("--root", type=Path, required=True, help="Root folder to search recursively.")
-    ap.add_argument("--out", type=Path, default=Path("highlighted_option_counts.csv"),
-                    help="Output CSV file (2 columns: File Path, Word Frequency).")
-    args = ap.parse_args()
+    p.add_argument("--root", type=Path, required=True, help="Root folder to search recursively.")
+    p.add_argument("--out", type=Path, default=Path("highlighted_option_docx.csv"),
+                   help="Output CSV file (File Path, Word Frequency).")
+    args = p.parse_args()
 
-    if not args.root.exists():
-        ap.error(f"--root path does not exist: {args.root}")
-
-    files = sorted([p for p in args.root.rglob("*") if p.suffix.lower() in (".docx", ".pdf")])
+    files = sorted([f for f in args.root.rglob("*.docx")])
     headers = ["File Path", "Word Frequency"]
     args.out.parent.mkdir(parents=True, exist_ok=True)
 
     with args.out.open("w", newline="", encoding="utf-8") as fp:
+        import csv
         w = csv.DictWriter(fp, fieldnames=headers)
         w.writeheader()
 
         total = len(files)
         for idx, f in enumerate(files, 1):
-            try:
-                if f.suffix.lower() == ".docx":
-                    cnt = count_highlighted_option_docx(f)
-                else:
-                    cnt = count_highlighted_option_pdf(f)
-                w.writerow({"File Path": str(f), "Word Frequency": cnt})
-            except Exception as e:
-                print(f"[error] {f}: {e}", file=sys.stderr)
-                w.writerow({"File Path": str(f), "Word Frequency": 0})
-
+            cnt = count_highlighted_option_docx(f)
+            w.writerow({"File Path": str(f), "Word Frequency": cnt})
             if idx % 100 == 0 or idx == total:
-                print(f"[progress] {idx}/{total} processed", file=sys.stderr)
+                print(f"[progress] {idx}/{total} processed")
 
-    print(f"[done] Wrote {len(files)} rows → {args.out}")
+    print(f"[done] Wrote {len(files)} DOCX results → {args.out}")
 
 if __name__ == "__main__":
     main()
