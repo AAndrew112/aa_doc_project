@@ -1,19 +1,26 @@
 #!/usr/bin/env python3
 from pathlib import Path
-import argparse, csv, sys
+import argparse, csv, sys, logging
 from zipfile import ZipFile
 import xml.etree.ElementTree as ET
 import pdfplumber
 from collections import defaultdict, deque
 
+# -------------------- Silence pdfminer/pdfplumber noisy logs --------------------
+for name in ("pdfminer", "pdfminer.pdfinterp", "pdfminer.converter", "pdfminer.layout"):
+    logging.getLogger(name).setLevel(logging.ERROR)
+
 # ========================== DOCX (XML-based) ==========================
 W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+NS = {"w": W_NS}
+
 PARTS_TO_SCAN = {
     "Body":       "word/document.xml",
     "Footnotes":  "word/footnotes.xml",
     "Endnotes":   "word/endnotes.xml",
     "Comments":   "word/comments.xml",
 }
+
 def _list_header_footer_parts(zf: ZipFile):
     headers, footers = [], []
     for name in zf.namelist():
@@ -30,40 +37,87 @@ def _count_tbls_in_part(zf: ZipFile, part_name: str):
     try:
         xml = zf.read(part_name)
     except KeyError:
-        return 0, 0
+        return 0
     root = ET.fromstring(xml)
-    parent_map = {child: parent for parent in root.iter() for child in parent}
-    total = 0
-    txbx = 0
-    for tbl in root.iter(f"{{{W_NS}}}tbl"):
-        total += 1
-        p = parent_map.get(tbl)
-        inside_txbx = False
-        while p is not None:
-            # broaden: count any txbxContent regardless of prefix ns
-            if _localname(p.tag) == "txbxContent":
-                inside_txbx = True
-                break
-            p = parent_map.get(p)
-        if inside_txbx:
-            txbx += 1
-    return total, txbx
+    return sum(1 for _ in root.iter(f"{{{W_NS}}}tbl"))
 
-def count_tables_docx_xml(path: Path) -> int:
-    total_tables = 0
+def count_tables_docx_real(path: Path) -> int:
+    total = 0
     with ZipFile(path) as zf:
         for _, part in PARTS_TO_SCAN.items():
-            tot, _ = _count_tbls_in_part(zf, part)
-            total_tables += tot
+            total += _count_tbls_in_part(zf, part)
         headers, footers = _list_header_footer_parts(zf)
         for part in headers:
-            tot, _ = _count_tbls_in_part(zf, part); total_tables += tot
+            total += _count_tbls_in_part(zf, part)
         for part in footers:
-            tot, _ = _count_tbls_in_part(zf, part); total_tables += tot
-    return total_tables
+            total += _count_tbls_in_part(zf, part)
+    return total
+
+# -------- DOCX tabbed “tables” (pseudo-tables made with tabs) --------
+def _docx_iter_paragraphs(zf: ZipFile):
+    # Only main document; you can add footnotes/endnotes if desired
+    try:
+        root = ET.fromstring(zf.read("word/document.xml"))
+    except KeyError:
+        return []
+    return list(root.iter(f"{{{W_NS}}}p"))
+
+def _count_tabs_in_para(p_el) -> int:
+    # Count <w:tab/> occurrences in paragraph (across runs)
+    return sum(1 for el in p_el.iter() if _localname(el.tag) == "tab")
+
+def count_tables_docx_tabbed(path: Path, min_cols=3, min_rows=3) -> int:
+    """
+    Heuristic: A 'tab table' is a run of >= min_rows consecutive paragraphs
+    where each paragraph contains >= (min_cols-1) tab stops, and the tab counts
+    within the run are consistent (all equal).
+    """
+    try:
+        with ZipFile(path) as zf:
+            paras = _docx_iter_paragraphs(zf)
+    except Exception:
+        return 0
+
+    rows = [(i, _count_tabs_in_para(p)) for i, p in enumerate(paras)]
+    # keep only paragraphs with enough tabs to imply >= min_cols columns
+    rows = [(i, t) for i, t in rows if t >= (min_cols - 1)]
+    if not rows:
+        return 0
+
+    tab_tables = 0
+    run_start = None
+    run_tabs = []
+
+    def close_run():
+        nonlocal tab_tables, run_start, run_tabs
+        if not run_tabs:
+            return
+        # check length and consistency (all same tab count)
+        if len(run_tabs) >= min_rows and len(set(run_tabs)) == 1:
+            tab_tables += 1
+        run_start = None
+        run_tabs = []
+
+    prev_i = None
+    for i, t in rows:
+        if prev_i is not None and i == prev_i + 1:
+            # continue run
+            if run_start is None:
+                run_start = prev_i
+                run_tabs = [rows[[r[0] for r in rows].index(prev_i)][1]]  # prev tab count
+            run_tabs.append(t)
+        else:
+            close_run()
+        prev_i = i
+    close_run()
+
+    return tab_tables
+
+def count_tables_docx_total(path: Path) -> int:
+    # Sum real tables and tabbed pseudo-tables
+    return count_tables_docx_real(path) + count_tables_docx_tabbed(path)
 
 # ========================== PDF (lattice-only, aggressive recall) ==========================
-# Defaults tuned for higher recall without reintroducing stream FPs
 SNAP_TOL = 3.0              # pts to snap/cluster parallel lines
 MIN_LINE_LEN_FRAC = 0.06    # min line length as fraction of min(page_w, page_h)
 MIN_V_LINES = 3
@@ -236,7 +290,7 @@ def detect_tables_lattice(page):
         return []
 
     # Connected components
-    seen = set(); tables = []
+    seen = set(); boxes = []
     nodes = set(adj.keys())
     for node in list(nodes):
         if node in seen: continue
@@ -268,22 +322,26 @@ def detect_tables_lattice(page):
         if y1 <= ph * HEADER_FOOTER_IGNORE or y0 >= ph * (1.0 - HEADER_FOOTER_IGNORE):
             continue
 
-        tables.append(bbox)
+        boxes.append(bbox)
 
-    return _merge_nearby(tables, pw, ph, MERGE_VGAP_FRAC, MERGE_H_OVERLAP)
+    return _merge_nearby(boxes, pw, ph, MERGE_VGAP_FRAC, MERGE_H_OVERLAP)
 
 def count_tables_pdf(path: Path) -> int:
     total = 0
-    with pdfplumber.open(path) as pdf:
-        for page in pdf.pages:
-            boxes = detect_tables_lattice(page)
-            total += len(boxes)
+    try:
+        with pdfplumber.open(path) as pdf:
+            for page in pdf.pages:
+                total += len(detect_tables_lattice(page))
+    except Exception as e:
+        # swallow per-file PDF parsing errors; logged as error row later
+        print(f"[error:pdf] {path}: {e}", file=sys.stderr)
+        return 0
     return total
 
 # ================================ Runner =================================
 def main():
     p = argparse.ArgumentParser(
-        description="Count tables in DOCX (XML scan) and PDF (lattice-only, aggressive recall). Outputs CSV with File Path, File Type, Total Tables."
+        description="Count tables in DOCX (real + tabbed) and PDF (lattice-only). Outputs CSV with File Path, File Type, Total Tables."
     )
     p.add_argument("--root", type=Path, required=True, help="Root folder to search (recursively).")
     p.add_argument("--out", type=Path, default=Path("universal_table_counts.csv"),
@@ -293,7 +351,6 @@ def main():
     if not args.root.exists():
         p.error(f"--root path does not exist: {args.root}")
 
-    # Collect all targets (no limit)
     targets = [p for p in args.root.rglob("*") if p.suffix.lower() in (".pdf", ".docx")]
     targets.sort()
 
@@ -315,15 +372,13 @@ def main():
                     n = count_tables_pdf(f)
                     w.writerow({"File Path": str(f), "File Type": "PDF", "Total Tables": n})
                 else:  # .docx
-                    n = count_tables_docx_xml(f)
+                    n = count_tables_docx_total(f)
                     w.writerow({"File Path": str(f), "File Type": "DOCX", "Total Tables": n})
             except Exception as e:
                 print(f"[error] {f}: {e}", file=sys.stderr)
-                # still write a row so you can see failures
                 w.writerow({"File Path": str(f), "File Type": f.suffix.upper().lstrip("."), "Total Tables": ""})
 
-            # lightweight progress
-            if idx % 50 == 0 or idx == total:
+            if idx % 100 == 0 or idx == total:
                 print(f"[progress] {idx}/{total} processed")
 
     print(f"[done] Wrote {len(targets)} rows → {args.out}")
