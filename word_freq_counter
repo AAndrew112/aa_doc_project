@@ -3,23 +3,19 @@ from pathlib import Path
 import argparse, csv, sys, re, logging
 from zipfile import ZipFile
 import xml.etree.ElementTree as ET
-
-# Optional for PDFs
 import pdfplumber
 
-# Silence noisy pdfminer/pdfplumber logs
+# ---------------- Silence noisy logs ----------------
 for name in ("pdfminer", "pdfminer.pdfinterp", "pdfminer.converter", "pdfminer.layout"):
     logging.getLogger(name).setLevel(logging.ERROR)
 
+# ---------------- Shared constants ----------------
 W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 WORD_RE = re.compile(r"\boption\b", re.IGNORECASE)
 
-# ---------------- DOCX: count highlighted "option" ----------------
+# ---------------- DOCX ----------------
 def count_highlighted_option_docx(path: Path) -> int:
-    """
-    Counts case-insensitive occurrences of the word 'option' that are in runs with w:highlight.
-    Scans main document.xml (body); extend to headers/footers if needed.
-    """
+    """Count occurrences of the word 'option' that are highlighted in DOCX."""
     try:
         with ZipFile(path) as zf:
             xml = zf.read("word/document.xml")
@@ -33,33 +29,26 @@ def count_highlighted_option_docx(path: Path) -> int:
 
     ns = {"w": W_NS}
     total = 0
-    # Iterate all runs
     for r in root.iter(f"{{{W_NS}}}r"):
         rPr = r.find("w:rPr", ns)
         if rPr is None:
             continue
         h = rPr.find("w:highlight", ns)
-        # Highlight counts if the tag exists and val != 'none' (or no val attr)
         if h is None:
             continue
         val = h.get(f"{{{W_NS}}}val")
         if val == "none":
             continue
 
-        # Collect visible text in this run
         texts = [t.text or "" for t in r.findall("w:t", ns)]
         if not texts:
-            # also consider tab-delimited text within run; unlikely needed for a single word
             continue
         run_text = "".join(texts)
-        # Count standalone word matches within this highlighted run
         total += len(WORD_RE.findall(run_text))
     return total
 
-# ------------- PDF: count highlighted "option" via highlight annots -------------
+# ---------------- PDF ----------------
 def _bbox_from_quadpoints(quadpoints):
-    # quadpoints: [x1 y1 x2 y2 x3 y3 x4 y4] per PDF spec, possibly multiple of 8
-    # Return list of (x0, top, x1, bottom) boxes
     boxes = []
     if not quadpoints:
         return boxes
@@ -73,10 +62,7 @@ def _bbox_from_quadpoints(quadpoints):
     return boxes
 
 def count_highlighted_option_pdf(path: Path) -> int:
-    """
-    Counts case-insensitive 'option' occurrences inside PDF Highlight annotations.
-    We extract text within each highlight quad/rect and count word matches.
-    """
+    """Count occurrences of the word 'option' that are highlighted in a PDF."""
     total = 0
     try:
         with pdfplumber.open(path) as pdf:
@@ -95,7 +81,6 @@ def count_highlighted_option_pdf(path: Path) -> int:
                         elif "QuadPoints" in a and a["QuadPoints"]:
                             boxes.extend(_bbox_from_quadpoints(a["QuadPoints"]))
                         elif "rect" in a and a["rect"]:
-                            # rect: [x0, top, x1, bottom]
                             r = a["rect"]
                             boxes.append((r[0], r[1], r[2], r[3]))
                         elif "Rect" in a and a["Rect"]:
@@ -105,7 +90,6 @@ def count_highlighted_option_pdf(path: Path) -> int:
                             continue
 
                         for (x0, top, x1, bottom) in boxes:
-                            # Crop & extract text inside the highlight bbox
                             try:
                                 with page.crop((x0, top, x1, bottom)) as cp:
                                     txt = cp.extract_text() or ""
@@ -115,27 +99,25 @@ def count_highlighted_option_pdf(path: Path) -> int:
                                 continue
                             total += len(WORD_RE.findall(txt))
                     except Exception:
-                        # Skip malformed annotation entries
                         continue
     except Exception:
         return 0
     return total
 
-# ------------------------------- Runner --------------------------------
+# ---------------- Runner ----------------
 def main():
     ap = argparse.ArgumentParser(
-        description="Find highlighted occurrences of the word 'option' (case-insensitive) in DOCX and PDF files."
+        description="Count highlighted occurrences of 'option' in DOCX and PDF files (case-insensitive)."
     )
     ap.add_argument("--root", type=Path, required=True, help="Root folder to search recursively.")
     ap.add_argument("--out", type=Path, default=Path("highlighted_option_counts.csv"),
-                    help="Output CSV path (2 columns: File Path, Word Frequency).")
+                    help="Output CSV file (2 columns: File Path, Word Frequency).")
     args = ap.parse_args()
 
     if not args.root.exists():
         ap.error(f"--root path does not exist: {args.root}")
 
     files = sorted([p for p in args.root.rglob("*") if p.suffix.lower() in (".docx", ".pdf")])
-
     headers = ["File Path", "Word Frequency"]
     args.out.parent.mkdir(parents=True, exist_ok=True)
 
@@ -143,23 +125,22 @@ def main():
         w = csv.DictWriter(fp, fieldnames=headers)
         w.writeheader()
 
+        total = len(files)
         for idx, f in enumerate(files, 1):
             try:
                 if f.suffix.lower() == ".docx":
                     cnt = count_highlighted_option_docx(f)
                 else:
                     cnt = count_highlighted_option_pdf(f)
-                # Only emit rows where at least one highlighted 'option' is found
-                if cnt > 0:
-                    w.writerow({"File Path": str(f), "Word Frequency": cnt})
+                w.writerow({"File Path": str(f), "Word Frequency": cnt})
             except Exception as e:
-                # If you want to see problems during the scan, log them:
                 print(f"[error] {f}: {e}", file=sys.stderr)
+                w.writerow({"File Path": str(f), "Word Frequency": 0})
 
-            if idx % 100 == 0:
-                print(f"[progress] {idx}/{len(files)} scanned", file=sys.stderr)
+            if idx % 100 == 0 or idx == total:
+                print(f"[progress] {idx}/{total} processed", file=sys.stderr)
 
-    print(f"[done] Wrote results to {args.out}")
+    print(f"[done] Wrote {len(files)} rows → {args.out}")
 
 if __name__ == "__main__":
     main()
