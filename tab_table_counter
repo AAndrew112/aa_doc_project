@@ -1,94 +1,76 @@
 import os
 import csv
-import re
 import argparse
+import re
 from docx import Document
 
 # ---------- detection helpers ----------
 
-_PUNCT_ONLY = re.compile(r"^[\W_\.]+$")          # reject leaders/underscores/punct-only
-_HAS_ALNUM   = re.compile(r"[A-Za-z0-9]{2,}")    # require real text in a column
+_WORDY = re.compile(r"[A-Za-z0-9]{2,}")
 
 def is_tabbed_row(txt: str) -> bool:
-    """
-    True if a line looks like a real 'tabbed-table' row:
-    - at least 2 nonempty tab-separated parts
-    - each 'kept' column must contain real text (not just dots/underscores/punct)
-    """
-    if not txt:
+    """True if the line looks like a real tabbed row (2+ meaningful columns)."""
+    if not txt or not txt.strip():
         return False
-    parts = [p.strip() for p in txt.split("\t")]
-    parts = [p for p in parts if p]  # drop empty
+    parts = [p.strip() for p in txt.split("\t") if p.strip()]
     if len(parts) < 2:
         return False
-    good_cols = [p for p in parts if _HAS_ALNUM.search(p) and not _PUNCT_ONLY.match(p)]
-    return len(good_cols) >= 2
+    ok_cols = [p for p in parts if _WORDY.search(p)]
+    return len(ok_cols) >= 2
 
-def normalize_snippet(s: str) -> str:
-    """Compact whitespace and tabs for the snippet preview."""
-    s = s.strip()
-    # collapse internal whitespace
-    s = re.sub(r"\s+", " ", s)
-    return s
+def normalize_snippet(txt: str, max_len: int = 200) -> str:
+    """Clean up tabs for readability and trim."""
+    s = " | ".join(p.strip() for p in txt.split("\t") if p.strip())
+    s = re.sub(r"\s+", " ", s).strip()
+    return s[:max_len]
 
-# ---------- docx processing ----------
+# ---------- per-file processing ----------
 
-def process_docx(path: str):
-    """
-    Returns (tabbed_table_count, snippet_text)
-    - Counts a 'table' as a *block* of consecutive tabbed rows.
-    - Snippet shows up to two first rows from the first tables found.
-    """
+def process_docx(file_path: str):
+    """Count tabbed tables in the document BODY and collect one snippet per table."""
     try:
-        doc = Document(path)
+        doc = Document(file_path)
     except Exception:
         return 0, ""
 
     count = 0
-    in_block = False
     snippets = []
 
-    # doc.paragraphs only covers the document body, not headers/footers
-    for para in doc.paragraphs:
+    in_table_block = False
+    for para in doc.paragraphs:  # body only (headers/footers not included)
         txt = para.text or ""
         if is_tabbed_row(txt):
-            if not in_block:
+            if not in_table_block:
+                # start of a new tabbed "table"
                 count += 1
-                in_block = True
-                if len(snippets) < 2:
-                    snippets.append(normalize_snippet(txt))
-            else:
-                # still inside same table block; do not increment count
-                pass
+                snippets.append(normalize_snippet(txt))
+                in_table_block = True
         else:
-            in_block = False
+            # leaving a table block (allow strict adjacency)
+            if in_table_block:
+                in_table_block = False
 
-        if len(snippets) >= 2 and count > 0:
-            # we already have enough preview, keep scanning cheaply
-            continue
+    return count, "\n".join(snippets)
 
-    snippet_text = " / ".join(snippets)  # no trailing slash when only one
-    return count, snippet_text
+# ---------- CLI / traversal ----------
 
-# ---------- CLI ----------
-
-def main():
-    ap = argparse.ArgumentParser(description="Count tabbed tables in DOCX files.")
-    ap.add_argument("--root", required=True, help="Root directory to search")
-    args = ap.parse_args()
-
-    out_csv = "tabbed_table_summary.csv"
+def scan(root: str, out_csv: str):
     with open(out_csv, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         w.writerow(["File Path", "Tabbed Table Count", "Snippet"])
-        for dirpath, _, filenames in os.walk(args.root):
-            for fn in filenames:
-                if fn.lower().endswith(".docx"):
-                    fp = os.path.join(dirpath, fn)
-                    count, snippet = process_docx(fp)
-                    w.writerow([fp, count, snippet])
+        for dirpath, _, filenames in os.walk(root):
+            for name in filenames:
+                if name.lower().endswith(".docx"):
+                    path = os.path.join(dirpath, name)
+                    count, snippet = process_docx(path)
+                    w.writerow([path, count, snippet])
 
-    print(f"Results saved to {out_csv}")
+def main():
+    p = argparse.ArgumentParser(description="Find tabbed tables in DOCX files.")
+    p.add_argument("--root", required=True, help="Root directory to search")
+    args = p.parse_args()
+    scan(args.root, "tabbed_table_summary.csv")
+    print("Saved: tabbed_table_summary.csv")
 
 if __name__ == "__main__":
     main()
