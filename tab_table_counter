@@ -1,208 +1,94 @@
-#!/usr/bin/env python3
-"""
-Recursively scan .docx files and count "tabbed tables" (blocks of lines aligned with TABs).
-Writes CSV with: File Path, Tabbed Table Count, Tabbed Table Sample
-
-Usage:
-  python tabbed_table_scan.py --root /path/to/top/folder
-"""
-
-import argparse
+import os
 import csv
-import sys
-from pathlib import Path
-from typing import Set, List, Optional
-
+import re
+import argparse
 from docx import Document
 
+# ---------- detection helpers ----------
 
-# ---------- Helpers to exclude non-body content ----------
+_PUNCT_ONLY = re.compile(r"^[\W_\.]+$")          # reject leaders/underscores/punct-only
+_HAS_ALNUM   = re.compile(r"[A-Za-z0-9]{2,}")    # require real text in a column
 
-def _paragraph_elements_in_real_tables(doc: Document) -> Set[object]:
-    """Collect XML <w:p> elements for paragraphs inside real Word tables (to exclude)."""
-    elems = set()
-    for tbl in doc.tables:
-        for row in tbl.rows:
-            for cell in row.cells:
-                for par in cell.paragraphs:
-                    elems.add(par._p)
-    return elems
-
-
-def _paragraph_elements_in_headers_footers(doc: Document) -> Set[object]:
-    """Collect XML <w:p> elements for paragraphs living in headers/footers (to exclude)."""
-    elems = set()
-    for sect in doc.sections:
-        for hf in (sect.header, sect.first_page_header, sect.even_page_header,
-                   sect.footer, sect.first_page_footer, sect.even_page_footer):
-            if hf is None:
-                continue
-            for par in hf.paragraphs:
-                elems.add(par._p)
-    return elems
-
-
-def _is_list_paragraph(par) -> bool:
+def is_tabbed_row(txt: str) -> bool:
     """
-    Heuristic: skip numbered/bulleted list items.
-    Detects presence of <w:numPr> in the paragraph properties.
+    True if a line looks like a real 'tabbed-table' row:
+    - at least 2 nonempty tab-separated parts
+    - each 'kept' column must contain real text (not just dots/underscores/punct)
     """
-    pPr = par._p.pPr
-    if pPr is None:
+    if not txt:
         return False
-    # hasattr guards because python-docx may not expose everything uniformly
-    return getattr(pPr, "numPr", None) is not None
-
-
-# ---------- Tabbed-row / group detection ----------
-
-def _is_tab_row(text: str, min_tabs: int = 2) -> bool:
-    """
-    A "tab row" is a non-empty line with at least `min_tabs` TAB characters and
-    real content in multiple columns (to avoid counting indents).
-    """
-    if not text:
+    parts = [p.strip() for p in txt.split("\t")]
+    parts = [p for p in parts if p]  # drop empty
+    if len(parts) < 2:
         return False
-    tab_count = text.count("\t")
-    if tab_count < min_tabs:
-        return False
+    good_cols = [p for p in parts if _HAS_ALNUM.search(p) and not _PUNCT_ONLY.match(p)]
+    return len(good_cols) >= 2
 
-    parts = [p.strip() for p in text.split("\t")]
-    # Require at least 2 non-empty columns and most columns not empty
-    nonempty = sum(1 for p in parts if p)
-    if nonempty < 2:
-        return False
-    return nonempty >= max(2, len(parts) // 2)
+def normalize_snippet(s: str) -> str:
+    """Compact whitespace and tabs for the snippet preview."""
+    s = s.strip()
+    # collapse internal whitespace
+    s = re.sub(r"\s+", " ", s)
+    return s
 
+# ---------- docx processing ----------
 
-def _close_group(current_len: int, snippet_lines: List[str], snippets: List[str]) -> None:
+def process_docx(path: str):
     """
-    Close a current group if it qualifies (>=2 tab rows) and stash a compact snippet.
+    Returns (tabbed_table_count, snippet_text)
+    - Counts a 'table' as a *block* of consecutive tabbed rows.
+    - Snippet shows up to two first rows from the first tables found.
     """
-    if current_len >= 2:
-        # Build a short, single-line sample from the first 2 rows
-        sample = " / ".join(s.strip() for s in snippet_lines[:2] if s.strip())
-        # Keep sample reasonably short
-        if len(sample) > 200:
-            sample = sample[:197] + "..."
-        snippets.append(sample)
+    try:
+        doc = Document(path)
+    except Exception:
+        return 0, ""
 
+    count = 0
+    in_block = False
+    snippets = []
 
-def count_tabbed_tables_and_snippet(doc: Document) -> (int, Optional[str]):
-    """
-    Count tabbed-table groups and return (count, first_snippet_or_None).
-
-    Rules:
-      - Exclude paragraphs in real tables and headers/footers.
-      - Exclude numbered/bulleted list paragraphs.
-      - A group = >=2 consecutive tab rows.
-      - Allow column count variation of +/- 1 across the group.
-      - Do NOT break a group on a single blank/whitespace-only line (wrap tolerance = 1).
-    """
-    in_tables = _paragraph_elements_in_real_tables(doc)
-    in_hdrftr = _paragraph_elements_in_headers_footers(doc)
-
-    snippets: List[str] = []
-    current_len = 0
-    current_cols = None
-    snippet_lines: List[str] = []
-    gap_tolerance = 1
-    gaps = 0  # number of consecutive blank lines tolerated within a group
-
-    def close_group():
-        nonlocal current_len, current_cols, snippet_lines, gaps
-        _close_group(current_len, snippet_lines, snippets)
-        current_len = 0
-        current_cols = None
-        snippet_lines = []
-        gaps = 0
-
-    for par in doc.paragraphs:
-        if par._p in in_tables or par._p in in_hdrftr:
-            if current_len:
-                close_group()
-            continue
-        if _is_list_paragraph(par):
-            # Lists often include tabs for numbering; skip them.
-            if current_len:
-                close_group()
-            continue
-
-        text = par.text or ""
-        if _is_tab_row(text, min_tabs=2):  # require >= 3 apparent columns
-            cols = text.count("\t") + 1
-            if current_len == 0:
-                current_len = 1
-                current_cols = cols
-                snippet_lines = [text]
-                gaps = 0
+    # doc.paragraphs only covers the document body, not headers/footers
+    for para in doc.paragraphs:
+        txt = para.text or ""
+        if is_tabbed_row(txt):
+            if not in_block:
+                count += 1
+                in_block = True
+                if len(snippets) < 2:
+                    snippets.append(normalize_snippet(txt))
             else:
-                # Continue group if columns roughly consistent
-                if current_cols is None or abs(cols - current_cols) <= 1:
-                    current_len += 1
-                    snippet_lines.append(text)
-                    gaps = 0
-                else:
-                    # Column count jump → end previous group, start new one
-                    close_group()
-                    current_len = 1
-                    current_cols = cols
-                    snippet_lines = [text]
-                    gaps = 0
+                # still inside same table block; do not increment count
+                pass
         else:
-            # Non-tab line: allow ONE blank/whitespace-only line inside a group
-            if current_len > 0 and (text.strip() == "") and gaps < gap_tolerance:
-                gaps += 1
-                # Keep group open
-                continue
-            # Otherwise, close any open group
-            if current_len:
-                close_group()
+            in_block = False
 
-    # finalize
-    if current_len:
-        close_group()
+        if len(snippets) >= 2 and count > 0:
+            # we already have enough preview, keep scanning cheaply
+            continue
 
-    count = len(snippets)
-    return count, (snippets[0] if snippets else None)
+    snippet_text = " / ".join(snippets)  # no trailing slash when only one
+    return count, snippet_text
 
-
-# ---------- Filesystem + CSV ----------
-
-def process_root(root: Path, out_csv: Path) -> None:
-    files = sorted(root.rglob("*.docx"))
-    with out_csv.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(["File Path", "Tabbed Table Count", "Tabbed Table Sample"])
-
-        for fp in files:
-            try:
-                doc = Document(str(fp))
-                count, sample = count_tabbed_tables_and_snippet(doc)
-            except Exception as e:
-                count, sample = 0, None
-                print(f"[WARN] Failed to read {fp}: {e}", file=sys.stderr)
-            writer.writerow([str(fp), count, (sample or "")])
-
+# ---------- CLI ----------
 
 def main():
-    p = argparse.ArgumentParser(description="Count tab-created tables in .docx files.")
-    p.add_argument(
-        "--root",
-        required=True,
-        help="Top-level folder to scan recursively for .docx files.",
-    )
-    args = p.parse_args()
+    ap = argparse.ArgumentParser(description="Count tabbed tables in DOCX files.")
+    ap.add_argument("--root", required=True, help="Root directory to search")
+    args = ap.parse_args()
 
-    root = Path(args.root).expanduser().resolve()
-    if not root.exists():
-        print(f"[ERROR] Root path not found: {root}", file=sys.stderr)
-        sys.exit(1)
+    out_csv = "tabbed_table_summary.csv"
+    with open(out_csv, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["File Path", "Tabbed Table Count", "Snippet"])
+        for dirpath, _, filenames in os.walk(args.root):
+            for fn in filenames:
+                if fn.lower().endswith(".docx"):
+                    fp = os.path.join(dirpath, fn)
+                    count, snippet = process_docx(fp)
+                    w.writerow([fp, count, snippet])
 
-    out_csv = Path("tabbed_tables.csv")
-    process_root(root, out_csv)
-    print(f"Done. Wrote: {out_csv.resolve()}")
-
+    print(f"Results saved to {out_csv}")
 
 if __name__ == "__main__":
     main()
