@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 from pathlib import Path
-import argparse, csv, sys, logging
+import argparse, csv, sys, logging, math
 from zipfile import ZipFile
 import xml.etree.ElementTree as ET
 import pdfplumber
@@ -12,7 +12,6 @@ for name in ("pdfminer", "pdfminer.pdfinterp", "pdfminer.converter", "pdfminer.l
 
 # ========================== DOCX (XML-based) ==========================
 W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
-NS = {"w": W_NS}
 
 PARTS_TO_SCAN = {
     "Body":       "word/document.xml",
@@ -31,9 +30,9 @@ def _list_header_footer_parts(zf: ZipFile):
     return headers, footers
 
 def _localname(tag: str) -> str:
-    return tag.split("}", 1)[1] if tag and tag[0] == "{" else tag
+    return tag.split("}", 1)[1] if tag and tag.startswith("{") else tag
 
-def _count_tbls_in_part(zf: ZipFile, part_name: str):
+def _count_tbls_in_part(zf: ZipFile, part_name: str) -> int:
     try:
         xml = zf.read(part_name)
     except KeyError:
@@ -55,7 +54,6 @@ def count_tables_docx_real(path: Path) -> int:
 
 # -------- DOCX tabbed “tables” (pseudo-tables made with tabs) --------
 def _docx_iter_paragraphs(zf: ZipFile):
-    # Only main document; you can add footnotes/endnotes if desired
     try:
         root = ET.fromstring(zf.read("word/document.xml"))
     except KeyError:
@@ -63,14 +61,13 @@ def _docx_iter_paragraphs(zf: ZipFile):
     return list(root.iter(f"{{{W_NS}}}p"))
 
 def _count_tabs_in_para(p_el) -> int:
-    # Count <w:tab/> occurrences in paragraph (across runs)
+    # Count <w:tab/> occurrences in a paragraph
     return sum(1 for el in p_el.iter() if _localname(el.tag) == "tab")
 
 def count_tables_docx_tabbed(path: Path, min_cols=3, min_rows=3) -> int:
     """
-    Heuristic: A 'tab table' is a run of >= min_rows consecutive paragraphs
-    where each paragraph contains >= (min_cols-1) tab stops, and the tab counts
-    within the run are consistent (all equal).
+    Heuristic: a 'tab table' is a run of >= min_rows consecutive paragraphs
+    where each paragraph has >= (min_cols-1) tabs and the tab counts are equal.
     """
     try:
         with ZipFile(path) as zf:
@@ -79,65 +76,61 @@ def count_tables_docx_tabbed(path: Path, min_cols=3, min_rows=3) -> int:
         return 0
 
     rows = [(i, _count_tabs_in_para(p)) for i, p in enumerate(paras)]
-    # keep only paragraphs with enough tabs to imply >= min_cols columns
     rows = [(i, t) for i, t in rows if t >= (min_cols - 1)]
     if not rows:
         return 0
 
     tab_tables = 0
-    run_start = None
-    run_tabs = []
-
-    def close_run():
-        nonlocal tab_tables, run_start, run_tabs
-        if not run_tabs:
-            return
-        # check length and consistency (all same tab count)
-        if len(run_tabs) >= min_rows and len(set(run_tabs)) == 1:
-            tab_tables += 1
-        run_start = None
-        run_tabs = []
-
+    run_len = 0
     prev_i = None
+    prev_t = None
+
     for i, t in rows:
-        if prev_i is not None and i == prev_i + 1:
-            # continue run
-            if run_start is None:
-                run_start = prev_i
-                run_tabs = [rows[[r[0] for r in rows].index(prev_i)][1]]  # prev tab count
-            run_tabs.append(t)
+        if prev_i is not None and i == prev_i + 1 and t == prev_t:
+            run_len += 1
         else:
-            close_run()
-        prev_i = i
-    close_run()
+            if run_len >= min_rows:
+                tab_tables += 1
+            run_len = 1
+        prev_i, prev_t = i, t
+
+    if run_len >= min_rows:
+        tab_tables += 1
 
     return tab_tables
 
 def count_tables_docx_total(path: Path) -> int:
-    # Sum real tables and tabbed pseudo-tables
     return count_tables_docx_real(path) + count_tables_docx_tabbed(path)
 
-# ========================== PDF (lattice-only, aggressive recall) ==========================
-SNAP_TOL = 3.0              # pts to snap/cluster parallel lines
-MIN_LINE_LEN_FRAC = 0.06    # min line length as fraction of min(page_w, page_h)
-MIN_V_LINES = 3
-MIN_H_LINES = 3
-MIN_INTERSECTIONS = 4
+# ========================== PDF (lattice-only, higher recall) ==========================
+# Looser knobs to catch faint/short/near-header rulings and slight rotation
+SNAP_TOL = 4.0              # was 3.0
+MIN_LINE_LEN_FRAC = 0.03    # was 0.06 (accept shorter lines)
+MIN_V_LINES = 2             # was 3
+MIN_H_LINES = 2             # was 3
+MIN_INTERSECTIONS = 3       # was 4
 MIN_AREA_FRAC = 0.015
 MAX_AREA_FRAC = 0.60
 ASPECT_MIN = 0.33
 ASPECT_MAX = 3.0
-HEADER_FOOTER_IGNORE = 0.10
+HEADER_FOOTER_IGNORE = 0.06 # was 0.10 (don’t over-prune header regions)
 MERGE_VGAP_FRAC = 0.02
 MERGE_H_OVERLAP = 0.60
+ANG_TOL = 10  # degrees; accept lines within ±10° of horizontal/vertical
 
-def _is_vertical(ln):   # ln: dict with x0,x1,top,bottom
-    return abs(ln["x1"] - ln["x0"]) < abs(ln["bottom"] - ln["top"])
+def _angle_deg(x0, y0, x1, y1):
+    return abs(math.degrees(math.atan2((y1 - y0), (x1 - x0))))
 
-def _is_horizontal(ln):
-    return abs(ln["x1"] - ln["x0"]) >= abs(ln["bottom"] - ln["top"])
+def _is_vertical(ln):   # accept near-vertical within ANG_TOL
+    ang = _angle_deg(ln["x0"], ln["top"], ln["x1"], ln["bottom"])
+    return ang >= (90 - ANG_TOL)
+
+def _is_horizontal(ln): # accept near-horizontal within ANG_TOL
+    ang = _angle_deg(ln["x0"], ln["top"], ln["x1"], ln["bottom"])
+    return ang <= ANG_TOL
 
 def _line_length(ln):
+    # projected length along the dominant axis is fine here
     if _is_vertical(ln):
         return abs(ln["bottom"] - ln["top"])
     return abs(ln["x1"] - ln["x0"])
@@ -166,9 +159,7 @@ def _bbox_area_aspect(bbox, pw, ph):
     w = max(0.0, x1 - x0); h = max(0.0, y1 - y0)
     if pw <= 0 or ph <= 0 or w == 0 or h == 0:
         return 0.0, 0.0
-    area_frac = (w*h)/(pw*ph)
-    aspect = w/h
-    return area_frac, aspect
+    return (w*h)/(pw*ph), (w/h)
 
 def _merge_nearby(boxes, pw, ph, vgap_frac=MERGE_VGAP_FRAC, min_h_overlap=MERGE_H_OVERLAP):
     if not boxes: return boxes
@@ -207,14 +198,14 @@ def detect_tables_lattice(page):
 
     v_lines_raw, h_lines_raw = [], []
 
-    # 1) Native lines
+    # 1) Native lines (accept slight rotation via _is_vertical/_is_horizontal)
     for ln in getattr(page, "lines", []):
         if _line_length(ln) < min_len:
             continue
         if _is_vertical(ln):
             x = (ln["x0"] + ln["x1"]) / 2.0
             v_lines_raw.append((x, min(ln["top"], ln["bottom"]), max(ln["top"], ln["bottom"])))
-        else:
+        elif _is_horizontal(ln):
             y = (ln["top"] + ln["bottom"]) / 2.0
             h_lines_raw.append((y, min(ln["x0"], ln["x1"]), max(ln["x0"], ln["x1"])))
 
@@ -222,25 +213,26 @@ def detect_tables_lattice(page):
     for rc in getattr(page, "rects", []):
         x0, y0, x1, y1 = rc["x0"], rc["y0"], rc["x1"], rc["y1"]
         w, h = abs(x1 - x0), abs(y1 - y0)
-        if w >= min_len:  # top/bottom edges -> horizontals
+        if w >= min_len:
             y_top = min(y0, y1); y_bot = max(y0, y1)
             h_lines_raw.append((y_top, min(x0, x1), max(x0, x1)))
             h_lines_raw.append((y_bot, min(x0, x1), max(x0, x1)))
-        if h >= min_len:  # left/right edges -> verticals
+        if h >= min_len:
             x_left = min(x0, x1); x_right = max(x0, x1)
             v_lines_raw.append((x_left, min(y0, y1), max(y0, y1)))
             v_lines_raw.append((x_right, min(y0, y1), max(y0, y1)))
 
-    # 3) Near-axis curves as lines (hairline tables sometimes stored as curves)
+    # 3) Near-axis curves as lines
     for cv in getattr(page, "curves", []):
         x0, y0, x1, y1 = cv["x0"], cv["y0"], cv["x1"], cv["y1"]
         dx, dy = abs(x1 - x0), abs(y1 - y0)
         if max(dx, dy) < min_len:
             continue
-        if dy <= SNAP_TOL:  # near-horizontal
+        ang = _angle_deg(x0, y0, x1, y1)
+        if ang <= ANG_TOL:  # near-horizontal
             y = (y0 + y1) / 2.0
             h_lines_raw.append((y, min(x0, x1), max(x0, x1)))
-        elif dx <= SNAP_TOL:  # near-vertical
+        elif ang >= (90 - ANG_TOL):  # near-vertical
             x = (x0 + x1) / 2.0
             v_lines_raw.append((x, min(y0, y1), max(y0, y1)))
 
@@ -289,7 +281,7 @@ def detect_tables_lattice(page):
     if len(intersections) < MIN_INTERSECTIONS:
         return []
 
-    # Connected components
+    # Connected components -> candidate boxes
     seen = set(); boxes = []
     nodes = set(adj.keys())
     for node in list(nodes):
@@ -319,8 +311,12 @@ def detect_tables_lattice(page):
         area_frac, aspect = _bbox_area_aspect(bbox, pw, ph)
         if not (MIN_AREA_FRAC <= area_frac <= MAX_AREA_FRAC and ASPECT_MIN <= aspect <= ASPECT_MAX):
             continue
+
+        # Keep header/footer candidates (we already lowered HEADER_FOOTER_IGNORE)
         if y1 <= ph * HEADER_FOOTER_IGNORE or y0 >= ph * (1.0 - HEADER_FOOTER_IGNORE):
-            continue
+            # If you still want to exclude ultra-thin letterhead lines, uncomment next line:
+            # continue
+            pass
 
         boxes.append(bbox)
 
@@ -333,7 +329,6 @@ def count_tables_pdf(path: Path) -> int:
             for page in pdf.pages:
                 total += len(detect_tables_lattice(page))
     except Exception as e:
-        # swallow per-file PDF parsing errors; logged as error row later
         print(f"[error:pdf] {path}: {e}", file=sys.stderr)
         return 0
     return total
@@ -341,7 +336,7 @@ def count_tables_pdf(path: Path) -> int:
 # ================================ Runner =================================
 def main():
     p = argparse.ArgumentParser(
-        description="Count tables in DOCX (real + tabbed) and PDF (lattice-only). Outputs CSV with File Path, File Type, Total Tables."
+        description="Count tables in DOCX (real + tabbed) and PDF (lattice-only, higher recall). Outputs: File Path, File Type, Total Tables."
     )
     p.add_argument("--root", type=Path, required=True, help="Root folder to search (recursively).")
     p.add_argument("--out", type=Path, default=Path("universal_table_counts.csv"),
