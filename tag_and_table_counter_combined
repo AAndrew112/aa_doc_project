@@ -1,0 +1,181 @@
+#!/usr/bin/env python3
+from pathlib import Path
+import argparse
+import csv
+import sys
+from datetime import datetime
+from docx import Document
+from zipfile import ZipFile
+import xml.etree.ElementTree as ET
+
+W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+
+PARTS_TO_SCAN = {
+    "Body":       "word/document.xml",
+    "Footnotes":  "word/footnotes.xml",
+    "Endnotes":   "word/endnotes.xml",
+    "Comments":   "word/comments.xml",
+}
+
+# ------------------- Timestamp helper -------------------
+def timestamped_outpath(out_path: Path) -> Path:
+    ts = datetime.now().strftime("%m%d%Y_%H%M")
+    stem, suf = out_path.stem, (out_path.suffix or ".csv")
+    return out_path.with_name(f"{stem}__{ts}{suf}")
+
+# ------------------- DOCX tag counting -------------------
+def extract_text_and_highlight_blocks(path: Path, include_tables=True, include_hf=True, merge_across_paragraphs=False):
+    doc = Document(path)
+    chunks = []
+    highlight_blocks = 0
+    carry_in_block = False if merge_across_paragraphs else None
+
+    def add_paragraphs(paragraphs):
+        nonlocal highlight_blocks, carry_in_block
+        for p in paragraphs:
+            if p.text:
+                chunks.append(p.text)
+            in_block = bool(carry_in_block) if merge_across_paragraphs else False
+            for r in p.runs:
+                is_hl = bool(r.font and r.font.highlight_color)
+                if is_hl and not in_block:
+                    highlight_blocks += 1
+                    in_block = True
+                elif not is_hl and in_block:
+                    in_block = False
+            if merge_across_paragraphs:
+                carry_in_block = in_block
+
+    add_paragraphs(doc.paragraphs)
+    if include_tables:
+        for tbl in doc.tables:
+            for row in tbl.rows:
+                for cell in row.cells:
+                    add_paragraphs(cell.paragraphs)
+    if include_hf:
+        for section in doc.sections:
+            if section.header:
+                add_paragraphs(section.header.paragraphs)
+                for tbl in section.header.tables:
+                    for row in tbl.rows:
+                        for cell in row.cells:
+                            add_paragraphs(cell.paragraphs)
+            if section.footer:
+                add_paragraphs(section.footer.paragraphs)
+                for tbl in section.footer.tables:
+                    for row in tbl.rows:
+                        for cell in row.cells:
+                            add_paragraphs(cell.paragraphs)
+    return "\n".join(chunks), highlight_blocks
+
+def count_pairs_and_empty(text: str):
+    stack = []
+    pairs = 0
+    empty_pairs = 0
+    for i, ch in enumerate(text):
+        if ch == "[":
+            stack.append(i)
+        elif ch == "]":
+            if stack:
+                start = stack.pop()
+                pairs += 1
+                if text[start+1:i].strip() == "":
+                    empty_pairs += 1
+    return pairs, empty_pairs
+
+# ------------------- DOCX table counting -------------------
+def _list_header_footer_parts(zf: ZipFile):
+    headers, footers = [], []
+    for name in zf.namelist():
+        if name.startswith("word/header") and name.endswith(".xml"):
+            headers.append(name)
+        elif name.startswith("word/footer") and name.endswith(".xml"):
+            footers.append(name)
+    return headers, footers
+
+def _localname(tag: str) -> str:
+    if tag[0] == "{":
+        return tag.split("}", 1)[1]
+    return tag
+
+def _count_tbls_in_part(zf: ZipFile, part_name: str):
+    try:
+        xml = zf.read(part_name)
+    except KeyError:
+        return 0, 0
+    root = ET.fromstring(xml)
+    parent_map = {child: parent for parent in root.iter() for child in parent}
+    total = 0
+    txbx = 0
+    for tbl in root.iter(f"{{{W_NS}}}tbl"):
+        total += 1
+        p = parent_map.get(tbl)
+        inside_txbx = False
+        while p is not None:
+            if _localname(p.tag) == "txbxContent":
+                inside_txbx = True
+                break
+            p = parent_map.get(p)
+        if inside_txbx:
+            txbx += 1
+    return total, txbx
+
+def count_tables_docx_xml(path: Path):
+    counts = {
+        "Total Tables": 0
+    }
+    with ZipFile(path) as zf:
+        for label, part in PARTS_TO_SCAN.items():
+            tot, txbx = _count_tbls_in_part(zf, part)
+            counts["Total Tables"] += tot
+        headers, footers = _list_header_footer_parts(zf)
+        for part in headers + footers:
+            tot, txbx = _count_tbls_in_part(zf, part)
+            counts["Total Tables"] += tot
+    return counts
+
+# ------------------- Main -------------------
+def main():
+    p = argparse.ArgumentParser(description="Count DOCX tables and tags in a directory (all files included).")
+    p.add_argument("--root", type=Path, required=True, help="Root folder to search recursively.")
+    p.add_argument("--out", type=Path, default=Path("docx_summary.csv"), help="Output CSV filename (timestamp appended).")
+    p.add_argument("--no-timestamp", action="store_true", help="Do NOT append timestamp to output filename.")
+    args = p.parse_args()
+
+    if not args.root.exists():
+        p.error(f"--root path does not exist: {args.root}")
+
+    out_path = args.out if args.no_timestamp else timestamped_outpath(args.out)
+
+    # Recursively get all files
+    all_files = list(args.root.rglob("*"))
+    print(f"Found {len(all_files)} files under {args.root}")
+
+    headers = ["File Path", "Total Tables", "Total Tags"]
+    rows = []
+
+    for f in all_files:
+        row = {"File Path": str(f), "Total Tables": "", "Total Tags": ""}
+        if f.suffix.lower() == ".docx":
+            try:
+                tbl_counts = count_tables_docx_xml(f)
+                text, highlight_blocks = extract_text_and_highlight_blocks(f)
+                pairs, empty_pairs = count_pairs_and_empty(text)
+                non_empty_pairs = pairs - empty_pairs
+                total_tags = max(pairs, highlight_blocks, non_empty_pairs)
+                row["Total Tables"] = tbl_counts["Total Tables"]
+                row["Total Tags"] = total_tags
+            except Exception as e:
+                print(f"[error] {f}: {e}", file=sys.stderr)
+        rows.append(row)
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(out_path, "w", newline="", encoding="utf-8") as fp:
+        writer = csv.DictWriter(fp, fieldnames=headers)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    print(f"Done. Wrote {len(rows)} rows → {out_path}")
+
+if __name__ == "__main__":
+    main()
