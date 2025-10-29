@@ -7,3 +7,43 @@ df["file name"] = df["file path"].apply(
         else Path(x).name.lower()
     )
 )
+
+
+from pathlib import Path
+import pandas as pd
+
+def remove_docx_duplicates(df, col="file path"):
+    """
+    Removes near-duplicates from a DataFrame where two file paths are identical
+    except that one ends in .doc and the other in .docx.
+    Keeps the .doc version and drops the .docx one.
+
+    Args:
+        df (pd.DataFrame): The dataframe containing file paths.
+        col (str): Name of the column containing the file paths.
+
+    Returns:
+        pd.DataFrame: New dataframe with .docx duplicates removed.
+    """
+    df = df.copy()
+
+    # Normalize paths to avoid case issues
+    df[col] = df[col].astype(str).str.strip()
+
+    # Build a "base path" (path without .doc or .docx extension)
+    df["_base"] = df[col].apply(
+        lambda x: str(Path(x)).replace(".docx", "").replace(".doc", "")
+    )
+
+    # Identify .docx rows that have a matching .doc base
+    to_drop = df[
+        df[col].str.lower().str.endswith(".docx")
+        & df["_base"].isin(
+            df.loc[df[col].str.lower().str.endswith(".doc"), "_base"]
+        )
+    ].index
+
+    # Drop them and clean up temp column
+    df = df.drop(index=to_drop).drop(columns="_base")
+
+    return df
