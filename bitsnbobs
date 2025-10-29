@@ -1,8 +1,12 @@
-$files = Get-Content "C:\path\to\filelist.txt"
-$source = "C:\path\to\source"
-$dest = "C:\path\to\output"
+$folder = "C:\path\to\your\folder"
+$word = New-Object -ComObject Word.Application
+$word.Visible = $false
 
-foreach ($f in $files) {
-    $match = Get-ChildItem -Path $source -Recurse -File | Where-Object { $_.Name -eq $f }
-    if ($match) { Copy-Item $match.FullName -Destination $dest }
+Get-ChildItem -Path $folder -Filter *.doc | ForEach-Object {
+    $docx = "$($_.DirectoryName)\$($_.BaseName).docx"
+    $doc = $word.Documents.Open($_.FullName)
+    $doc.SaveAs([ref]$docx, [ref]16)  # 16 = wdFormatXMLDocument (.docx)
+    $doc.Close()
 }
+
+$word.Quit()
