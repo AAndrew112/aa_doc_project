@@ -1,25 +1,8 @@
-out_dir = data / f"t{t_int}"
-res = az.run_dedupe(chunks, out_dir, t, min_df=2, ngram_range=(1, 2), batch=1500)
+$files = Get-Content "C:\path\to\filelist.txt"
+$source = "C:\path\to\source"
+$dest = "C:\path\to\output"
 
-# If you want dedupe only, stop here. Optionally print what was written:
-print(f"[done t{t_int}] pairs={res['pairs_csv']}\n               clusters={res['clusters_csv']}\n               report={res['report_path']}")
-
-# If you *do* want complexity, use the returned paths (do NOT hardcode 'clusters.csv'):
-# az.run_complexity(clean, res['clusters_csv'], out_dir, report_path=res['report_path'])
-
-file_string = """
-C:\Users\Amanda\Documents\project\data\file1.pdf
-C:\Users\Amanda\Documents\project\data\subfolder\file2.docx
-C:\Users\Amanda\Documents\project\file3.xlsx
-"""
-
-# Split into lines and extract filenames
-paths = file_string.strip().splitlines()
-filenames = [p.strip().split("\\")[-1] for p in paths if p.strip()]
-
-# Save to a new file
-with open("filelist_clean.txt", "w") as out:
-    for name in filenames:
-        out.write(name + "\n")
-
-print("Created filelist_clean.txt with", len(filenames), "entries.")
+foreach ($f in $files) {
+    $match = Get-ChildItem -Path $source -Recurse -File | Where-Object { $_.Name -eq $f }
+    if ($match) { Copy-Item $match.FullName -Destination $dest }
+}
