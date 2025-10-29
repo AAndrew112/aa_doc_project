@@ -1,12 +1,9 @@
-$folder = "C:\path\to\your\folder"
-$word = New-Object -ComObject Word.Application
-$word.Visible = $false
+from pathlib import Path
 
-Get-ChildItem -Path $folder -Filter *.doc | ForEach-Object {
-    $docx = "$($_.DirectoryName)\$($_.BaseName).docx"
-    $doc = $word.Documents.Open($_.FullName)
-    $doc.SaveAs([ref]$docx, [ref]16)  # 16 = wdFormatXMLDocument (.docx)
-    $doc.Close()
-}
-
-$word.Quit()
+df["file name"] = df["file path"].apply(
+    lambda x: (
+        (Path(x).stem + ".doc").lower()
+        if Path(x).suffix.lower() == ".docx"
+        else Path(x).name.lower()
+    )
+)
