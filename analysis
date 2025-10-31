@@ -1,0 +1,13 @@
+Division / Program	Which DOJ group owns or uses the data.
+System / Data Source Name	Official or internal name of the system or folder.
+Type	Database, file share, document management system, local files, etc.
+Access (Y/N)	Whether you can currently access it.
+Location / Connection String / Path	How to reach it (server name, network path, URL, etc.).
+Primary Data Types / Entities	Short list of what’s inside (cases, people, invoices, etc.).
+# Tables or Files (approx.)	Ballpark count — helps show scale.
+Structured / Unstructured	Database = structured, documents = unstructured.
+File Formats / DB Type	e.g., SQL Server, Access, Excel, PDF, Word.
+Owner / SME (if known)	Contact person or team that manages the data.
+Known Data Issues or Notes	Anything you’ve heard or seen (duplicates, missing data, bad naming).
+Migration Status	Not started / Mapped / In progress / Complete.
+Last Updated / Verified	When you last confirmed this info.
